@@ -37,6 +37,7 @@ slop-whir = { workspace = true }
 slop-futures = { workspace = true }
 slop-poseidon2 = { workspace = true }
 slop-uni-stark = { workspace = true }
+slop-veil = { workspace = true }
 
 # misc
 futures = { workspace = true }
@@ -48,6 +49,7 @@ rayon-scan = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 derive-where = { workspace = true }
+rand = { workspace = true }
 thousands = { workspace = true }
 deepsize2 = { workspace = true }
 
@@ -63,6 +65,7 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 [dev-dependencies]
 sp1-zkvm = { workspace = true }
 rand = { workspace = true }
+rand_chacha = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [features]

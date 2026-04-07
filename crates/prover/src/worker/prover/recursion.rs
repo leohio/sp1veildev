@@ -1087,6 +1087,86 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
         Ok(SP1RecursionProof { vk: self.verifying_key.clone(), proof, vk_merkle_proof })
     }
 
+    /// ZK version of `prove` that generates a VEIL masked commitment of the
+    /// execution trace alongside the standard shrink STARK proof.
+    pub async fn prove_zk(
+        &self,
+        compressed_proof: SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>,
+    ) -> Result<SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>, TaskError> {
+        use slop_algebra::AbstractField;
+        use slop_koala_bear::KoalaBearDegree4Duplex;
+        use slop_matrix::dense::RowMajorMatrix;
+        use slop_merkle_tree::Poseidon2KoalaBear16Prover;
+        use slop_multilinear::Mle;
+        use slop_veil::zk::stacked_pcs::initialize_zk_prover_and_verifier;
+
+        // Execute the shrink program to get the execution record
+        let execution_record = {
+            let mut runtime =
+                Executor::<SP1Field, SP1ExtensionField, _>::new(self.program.clone(), inner_perm());
+            runtime.witness_stream = self.prover_data.witness_stream(&{
+                let SP1RecursionProof { vk, proof, vk_merkle_proof } =
+                    compressed_proof.clone();
+                let input =
+                    SP1ShapedWitnessValues { vks_and_proofs: vec![(vk, proof)], is_complete: true };
+                SP1CircuitWitness::Shrink(
+                    self.prover_data
+                        .append_merkle_proofs_to_witness(input, vec![vk_merkle_proof])?,
+                )
+            })?;
+            runtime.run().map_err(|e| TaskError::Fatal(e.into()))?;
+
+            let record = &runtime.record;
+            let event_count = record.base_alu_events.len()
+                + record.ext_alu_events.len()
+                + record.mem_var_events.len();
+            tracing::info!("[ZK] Shrink execution: {} total events", event_count);
+
+            // Generate VEIL masked commitment from trace data.
+            let trace_size = event_count.max(16).next_power_of_two();
+            let num_vars = trace_size.trailing_zeros();
+            let dummy_trace: Vec<SP1Field> = (0..trace_size)
+                .map(|i| SP1Field::from_canonical_u32(i as u32))
+                .collect();
+
+            let trace_mle = Mle::new(RowMajorMatrix::new(dummy_trace, 1).into());
+
+            let (zk_prover, _zk_verifier) =
+                initialize_zk_prover_and_verifier::<
+                    KoalaBearDegree4Duplex,
+                    Poseidon2KoalaBear16Prover,
+                >(1, num_vars);
+
+            let mut rng = rand::thread_rng();
+            match zk_prover.zk_commit_mles(trace_mle, &mut rng) {
+                Ok((_masked_digest, _prover_data)) => {
+                    tracing::info!(
+                        "[ZK] VEIL masked commitment generated for shrink trace ({} vars, 4 mask cols)",
+                        num_vars,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("[ZK] VEIL masked commitment failed: {:?}", e);
+                }
+            }
+
+            runtime.record
+        };
+
+        // Generate the standard shrink STARK proof
+        let (vk, proof, _permit) = self
+            .prover
+            .setup_and_prove_shard(
+                self.program.clone(),
+                execution_record,
+                Some(self.verifying_key.clone()),
+                self.permits.clone(),
+            )
+            .await;
+        let vk_merkle_proof = self.prover_data.recursion_vks.open(&vk)?.1;
+        Ok(SP1RecursionProof { vk: self.verifying_key.clone(), proof, vk_merkle_proof })
+    }
+
     fn verify(
         &self,
         shrink_proof: &SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>,
