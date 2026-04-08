@@ -37,10 +37,6 @@ sp1-primitives = { workspace = true }
 slop-algebra = { workspace = true }
 slop-bn254 = { workspace = true }
 slop-stacked = { workspace = true }
-slop-veil = { workspace = true }
-slop-matrix = { workspace = true }
-slop-koala-bear = { workspace = true }
-slop-merkle-tree = { workspace = true }
 # slop-util = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true, features = ["derive", "rc"] }
@@ -75,7 +71,7 @@ mti = { workspace = true }
 opentelemetry = { workspace = true }
 pin-project = { workspace = true }
 tonic = { workspace = true }
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["stream", "rustls-tls"] }
 indicatif = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }

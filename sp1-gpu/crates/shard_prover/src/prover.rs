@@ -761,6 +761,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             evaluation_proof,
             zerocheck_proof: zerocheck_partial_sumcheck_proof,
             public_values,
+            veil_proof: None,
         };
 
         (proof, permit)

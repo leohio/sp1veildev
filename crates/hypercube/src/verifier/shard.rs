@@ -115,6 +115,9 @@ pub enum ShardVerifierError<EF, PcsError> {
     /// The height is larger than `1 << max_log_row_count`.
     #[error("height is larger than maximum possible value")]
     HeightTooLarge,
+    /// VEIL ZK proof verification failed.
+    #[error("VEIL ZK proof verification failed: {0}")]
+    VeilVerificationFailed(String),
 }
 
 /// Derive the error type from the jagged config.
@@ -448,6 +451,7 @@ where {
             zerocheck_proof,
             public_values,
             logup_gkr_proof,
+            veil_proof,
         } = proof;
 
         let max_log_row_count = self.jagged_pcs_verifier.max_log_row_count;
@@ -466,6 +470,15 @@ where {
 
         // Observe the public values.
         challenger.observe_constant_length_extension_slice(public_values);
+
+        // If the proof includes a VEIL ZK masking proof, observe the masked digest
+        // BEFORE the main commitment, matching the prover's challenger ordering.
+        if let Some(veil_proof) = veil_proof {
+            for elem in veil_proof.masked_commitment.iter() {
+                challenger.observe(GC::F::from_canonical_u32(elem.as_canonical_u32()));
+            }
+        }
+
         // Observe the main commitment.
         challenger.observe(*main_commitment);
         // Observe the number of chips.
@@ -658,6 +671,136 @@ where {
                 challenger,
             )
             .map_err(ShardVerifierError::InvalidopeningArgument)?;
+
+        // === VEIL ZK Proof Verification ===
+        // If the proof includes a VEIL masking proof, verify it.
+        if let Some(veil_proof) = veil_proof {
+            use slop_koala_bear::KoalaBearDegree4Duplex;
+            use slop_merkle_tree::Poseidon2KoalaBear16Prover;
+            use slop_veil::compiler::{ConstraintCtx, ReadingCtx};
+            use slop_veil::zk::stacked_pcs::initialize_zk_prover_and_verifier;
+            use slop_veil::zk::ZkVerifierCtx;
+
+            type VeilGC = KoalaBearDegree4Duplex;
+            type MK = Poseidon2KoalaBear16Prover;
+
+            type VeilEF = <VeilGC as slop_challenger::IopCtx>::EF;
+
+            let num_encoding_vars = veil_proof.num_encoding_vars;
+            let log_num_polys = veil_proof.log_num_polys;
+
+            // Initialize VEIL verifier.
+            let (_, pcs_verifier) =
+                initialize_zk_prover_and_verifier::<VeilGC, MK>(1, num_encoding_vars);
+
+            // Open the ZK proof and run verification.
+            let mut veil_verifier_ctx =
+                ZkVerifierCtx::init(veil_proof.zk_proof.clone(), Some(pcs_verifier));
+
+            // Read the oracle commitment from the VEIL transcript.
+            let oracle = veil_verifier_ctx
+                .read_oracle(num_encoding_vars, log_num_polys)
+                .ok_or_else(|| {
+                    ShardVerifierError::VeilVerificationFailed(
+                        "failed to read oracle from VEIL transcript".into(),
+                    )
+                })?;
+
+            // Read the masked sub-protocol transcript elements from the VEIL
+            // transcript, matching what the prover sent via send_values().
+            // These are the LogUp-GKR and zerocheck transcript values that
+            // would otherwise leak witness data.
+            {
+                // LogUp-GKR circuit output
+                let num_output = logup_gkr_proof.circuit_output.numerator.guts().as_buffer().len();
+                let den_output =
+                    logup_gkr_proof.circuit_output.denominator.guts().as_buffer().len();
+                let _num_vals: Vec<_> =
+                    (0..num_output).map(|_| veil_verifier_ctx.read_one().unwrap()).collect();
+                let _den_vals: Vec<_> =
+                    (0..den_output).map(|_| veil_verifier_ctx.read_one().unwrap()).collect();
+
+                // LogUp-GKR round proofs
+                for round in &logup_gkr_proof.round_proofs {
+                    let _round_vals: Vec<_> =
+                        (0..4).map(|_| veil_verifier_ctx.read_one().unwrap()).collect();
+                    for uni_poly in &round.sumcheck_proof.univariate_polys {
+                        let _coeffs: Vec<_> = (0..uni_poly.coefficients.len())
+                            .map(|_| veil_verifier_ctx.read_one().unwrap())
+                            .collect();
+                    }
+                }
+
+                // LogUp-GKR chip evaluations
+                for chip_eval in logup_gkr_proof.logup_evaluations.chip_openings.values() {
+                    let _main: Vec<_> = (0..chip_eval.main_trace_evaluations.len())
+                        .map(|_| veil_verifier_ctx.read_one().unwrap())
+                        .collect();
+                    if let Some(prep) = &chip_eval.preprocessed_trace_evaluations {
+                        let _prep: Vec<_> = (0..prep.len())
+                            .map(|_| veil_verifier_ctx.read_one().unwrap())
+                            .collect();
+                    }
+                }
+
+                // Zerocheck sumcheck univariate polynomial coefficients
+                for uni_poly in &zerocheck_proof.univariate_polys {
+                    let _coeffs: Vec<_> = (0..uni_poly.coefficients.len())
+                        .map(|_| veil_verifier_ctx.read_one().unwrap())
+                        .collect();
+                }
+
+                // Zerocheck opened values
+                for chip_vals in opened_values.chips.values() {
+                    let _main: Vec<_> = (0..chip_vals.main.local.len())
+                        .map(|_| veil_verifier_ctx.read_one().unwrap())
+                        .collect();
+                    if !chip_vals.preprocessed.local.is_empty() {
+                        let _prep: Vec<_> = (0..chip_vals.preprocessed.local.len())
+                            .map(|_| veil_verifier_ctx.read_one().unwrap())
+                            .collect();
+                    }
+                }
+            }
+
+            // Construct the evaluation point matching the prover:
+            // STARK evaluation_point (row vars) + VEIL-sampled RLC (column vars).
+            // GC::EF and VeilGC::EF are the same concrete type in SP1
+            // (BinomialExtensionField<KoalaBear, 4>). We transmute the slice
+            // since the compiler can't prove this across generic boundaries.
+            let stark_eval_point = &zerocheck_proof.point_and_eval.0;
+            assert_eq!(
+                std::mem::size_of::<GC::EF>(),
+                std::mem::size_of::<VeilEF>(),
+                "GC::EF and VeilEF must have the same layout"
+            );
+            let stark_as_veil: Vec<VeilEF> = stark_eval_point
+                .values()
+                .as_slice()
+                .iter()
+                .map(|v| unsafe { std::mem::transmute_copy(v) })
+                .collect();
+            let mut veil_point: slop_multilinear::Point<VeilEF> = stark_as_veil.into();
+            let rlc_point = ReadingCtx::sample_point(&mut veil_verifier_ctx, log_num_polys);
+            veil_point.extend(&rlc_point);
+
+            // Read the evaluation claim from the transcript.
+            let eval = veil_verifier_ctx.read_one().map_err(|e| {
+                ShardVerifierError::VeilVerificationFailed(format!(
+                    "failed to read eval from VEIL transcript: {e:?}"
+                ))
+            })?;
+
+            // Assert MLE evaluation (adds PCS constraint for verification).
+            veil_verifier_ctx.assert_mle_eval(oracle, veil_point, eval);
+
+            // Run the full VEIL verification (PCS + constraint checks).
+            veil_verifier_ctx
+                .verify()
+                .map_err(|e| ShardVerifierError::VeilVerificationFailed(format!("{e:?}")))?;
+
+            tracing::info!("[ZK] VEIL proof verified successfully");
+        }
 
         let [mut preprocessed_row_counts, mut main_row_counts]: [Vec<usize>; 2] = proof
             .evaluation_proof

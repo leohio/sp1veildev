@@ -188,7 +188,7 @@ impl<GC: ZkIopCtx, PC: PcsProverConfig<GC>> ZkProverCtx<GC, PC> {
     /// * `rng` — cryptographically secure random number generator.
     pub fn commit_mle<RNG>(
         &mut self,
-        mle: slop_multilinear::Mle<GC::F, slop_alloc::CpuBackend>,
+        mle: &slop_multilinear::Mle<GC::F, slop_alloc::CpuBackend>,
         log_num_polynomials: u32,
         rng: &mut RNG,
     ) -> Result<MleCommit, PcsCommitError>
@@ -202,6 +202,15 @@ impl<GC: ZkIopCtx, PC: PcsProverConfig<GC>> ZkProverCtx<GC, PC> {
             .commit_mle(mle, log_num_polynomials as usize, pcs_prover, rng)
             .map(|idx| MleCommit { inner: idx })?;
         Ok(commit)
+    }
+
+    /// Returns the commitment digests for all MLEs committed so far.
+    ///
+    /// Each entry corresponds to a prior `commit_mle` call, in order.
+    /// This is useful for observing the VEIL masked digest into an external
+    /// Fiat-Shamir challenger that is separate from VEIL's internal challenger.
+    pub fn committed_digests(&self) -> Vec<GC::Digest> {
+        self.inner.pcs_commitments().into_iter().map(|entry| entry.digest).collect()
     }
 
     /// Generates a zero-knowledge proof. Consumes self.

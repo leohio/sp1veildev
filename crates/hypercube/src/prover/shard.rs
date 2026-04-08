@@ -786,6 +786,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
             evaluation_proof,
             zerocheck_proof: zerocheck_partial_sumcheck_proof,
             public_values,
+            veil_proof: None,
         };
 
         (proof, permit)
@@ -799,9 +800,15 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         record: Record<GC, SC>,
         vk: Option<MachineVerifyingKey<GC>>,
         prover_permits: ProverSemaphore,
-    ) -> (MachineVerifyingKey<GC>, ShardProof<GC, PcsProof<GC, SC>>, ProverPermit)
+    ) -> Result<
+        (MachineVerifyingKey<GC>, ShardProof<GC, PcsProof<GC, SC>>, ProverPermit),
+        VeilProvingError,
+    >
     where
-        GC: slop_challenger::IopCtx<F = slop_koala_bear::KoalaBear>,
+        GC: slop_challenger::IopCtx<
+            F = sp1_primitives::SP1Field,
+            EF = sp1_primitives::SP1ExtensionField,
+        >,
         rand::distributions::Standard: rand::distributions::Distribution<GC::F>,
     {
         let pc_start = program.pc_start();
@@ -844,39 +851,56 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         let shard_data = ShardData { pk, main_trace_data };
 
         let prover = self.clone();
-        let (shard_proof, permit) = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let _span = tracing::debug_span!("[ZK] prove shard with data (VEIL)").entered();
             let mut rng = rand::thread_rng();
             prover.prove_shard_with_data_zk(shard_data, challenger, &mut rng)
         })
         .await
-        .unwrap();
+        .unwrap()?;
 
-        (vk, shard_proof, permit)
+        let (shard_proof, permit) = result;
+        Ok((vk, shard_proof, permit))
     }
 
     /// ZK version of `prove_shard_with_data` that uses VEIL masking on trace commitments
     /// and evaluation proofs to achieve zero-knowledge hiding of the execution trace.
     ///
-    /// The key differences from the non-ZK version:
-    /// 1. `commit_traces` is replaced with VEIL's `zk_commit_mles` (adds masking columns)
-    /// 2. `prove_trusted_evaluations` is replaced with VEIL's masked evaluation proof
+    /// The proof includes:
+    /// 1. A standard STARK proof (LogUp-GKR + zerocheck + Jagged PCS evaluation proof)
+    ///    for backward-compatibility with existing verifiers.
+    /// 2. A VEIL ZK proof (`VeilMaskingProof`) that masks the execution trace via
+    ///    `zk_commit_mles`, proving the same trace evaluations under a masked commitment.
     ///
-    /// The LogUp-GKR proof and zerocheck remain unchanged - they operate on the
-    /// challenger which absorbs the masked commitment, ensuring transcript consistency.
+    /// Both the VEIL masked commitment and the standard commitment are absorbed into
+    /// the Fiat-Shamir challenger, binding them into the transcript.
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
     pub fn prove_shard_with_data_zk<RNG: rand::CryptoRng + rand::Rng>(
         &self,
         data: ShardData<GC, SC, C>,
         mut challenger: GC::Challenger,
         rng: &mut RNG,
-    ) -> (ShardProof<GC, PcsProof<GC, SC>>, ProverPermit)
+    ) -> Result<(ShardProof<GC, PcsProof<GC, SC>>, ProverPermit), VeilProvingError>
     where
-        GC: slop_challenger::IopCtx<F = slop_koala_bear::KoalaBear>,
+        GC: slop_challenger::IopCtx<
+            F = sp1_primitives::SP1Field,
+            EF = sp1_primitives::SP1ExtensionField,
+        >,
         rand::distributions::Standard: rand::distributions::Distribution<GC::F>,
     {
         use slop_koala_bear::KoalaBearDegree4Duplex;
         use slop_merkle_tree::Poseidon2KoalaBear16Prover;
-        use slop_veil::zk::stacked_pcs::initialize_zk_prover_and_verifier;
+        use slop_veil::compiler::{ConstraintCtx, ReadingCtx, SendingCtx};
+        use slop_veil::zk::stacked_pcs::{
+            initialize_zk_prover_and_verifier, StackedPcsZkProverCtx,
+        };
+        use slop_veil::zk::{compute_mask_length, ZkProverCtx};
+
+        // VEIL only implements ZkIopCtx for KoalaBearDegree4Duplex.
+        // GC::F = SP1Field and GC::EF = SP1ExtensionField, which are the same
+        // concrete types as VeilGC's F and EF.
+        type VeilGC = KoalaBearDegree4Duplex;
+        type MK = Poseidon2KoalaBear16Prover;
 
         let ShardData { pk, main_trace_data } = data;
         let MainTraceData { traces, public_values, shard_chips, permit } = main_trace_data;
@@ -892,94 +916,96 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         // Observe the public values.
         challenger.observe_constant_length_slice(&public_values);
 
-        // === VEIL INTERVENTION POINT 1: Masked trace commitment ===
-        //
-        // Instead of `self.commit_traces(&traces)`, we:
-        // 1. Flatten all chip traces into a single MLE
-        // 2. Use VEIL's ZkBasefoldProver to commit with masking columns
-        //
-        // For now, we still use the standard commit for compatibility with the
-        // rest of the pipeline (LogUp-GKR, zerocheck, evaluation proof all expect
-        // JaggedProverData). The VEIL masked commitment is generated IN ADDITION
-        // to the standard commitment, demonstrating the masking mechanism.
-
+        // === Step 1: Standard trace commitment ===
+        // Required for LogUp-GKR and zerocheck which expect JaggedProverData.
         let (main_commit, main_data) = {
             let _span = tracing::debug_span!("[ZK] commit traces (standard)").entered();
             self.commit_traces(&traces)
         };
 
-        // Generate VEIL masked commitment alongside standard commitment.
-        let veil_masked_commit_ok: bool = {
-            let _span = tracing::debug_span!("[ZK] commit traces (VEIL masked)").entered();
-
-            // Flatten all traces into a single contiguous MLE for VEIL
-            let all_trace_values: Vec<GC::F> = traces
-                .values()
-                .flat_map(|padded_mle| {
-                    match padded_mle.inner() {
-                        Some(mle) => {
-                            mle.guts().as_buffer().as_slice().to_vec()
-                        }
-                        None => vec![],
-                    }
-                })
-                .collect();
-
-            let total_len = all_trace_values.len();
-            let num_vars = total_len.next_power_of_two().trailing_zeros();
-
-            tracing::info!(
-                "[ZK] Trace data: {} elements, {} variables, padding to {}",
-                total_len,
-                num_vars,
-                1usize << num_vars,
-            );
-
-            // Pad to power of 2
-            let mut padded = all_trace_values;
-            padded.resize(1usize << num_vars, GC::F::zero());
-
-            // Create MLE from the flattened trace
-            let trace_mle = slop_multilinear::Mle::new(
-                slop_matrix::dense::RowMajorMatrix::new(padded, 1).into()
-            );
-
-            // Initialize VEIL PCS (1 commitment, num_vars encoding variables)
-            // Use concrete KoalaBear types to satisfy VEIL's trait bounds.
-            let (zk_prover, _zk_verifier) =
-                initialize_zk_prover_and_verifier::<
-                    KoalaBearDegree4Duplex,
-                    Poseidon2KoalaBear16Prover,
-                >(1, num_vars);
-
-            // Commit with VEIL masking (adds mask columns + padding rows)
-            match zk_prover.zk_commit_mles(trace_mle, rng) {
-                Ok((_masked_digest, _prover_data)) => {
-                    tracing::info!(
-                        "[ZK] VEIL masked commitment generated successfully"
-                    );
-                    tracing::info!(
-                        "[ZK] Masking columns added: 4 (extension field degree)"
-                    );
-                    true
-                }
-                Err(e) => {
-                    tracing::warn!("[ZK] VEIL masked commitment failed: {:?}", e);
-                    false
-                }
-            }
+        // === Step 2: VEIL masked trace commitment ===
+        // Stack all chip traces into a single MLE preserving column structure.
+        let (stacked_mle, log_num_polys) = {
+            let _span = tracing::debug_span!("[ZK] stack traces for VEIL").entered();
+            stack_traces_for_veil(&traces)
         };
 
-        // Observe the standard commitment (for protocol compatibility)
+        let num_encoding_vars = stacked_mle.num_variables().saturating_sub(log_num_polys as u32);
+        let num_variables = stacked_mle.num_variables();
+
+        tracing::info!(
+            "[ZK] Stacked trace: {} total vars, {} encoding vars, {} log_num_polys",
+            num_variables,
+            num_encoding_vars,
+            log_num_polys,
+        );
+
+        // Compute mask length for the VEIL proof.
+        // We use compute_mask_length with a conservative overestimate of the
+        // transcript elements, since the exact sizes depend on the sub-proofs
+        // (which are generated after VEIL context initialization).
+        // The mask length governs the size of VEIL's random mask vector;
+        // overestimating is safe (costs a few extra field multiplications).
+        let max_log_row_count = self.max_log_row_count();
+        let num_chips = shard_chips.len();
+        let estimated_transcript_reads = 2 * (1usize << max_log_row_count)      // GKR output (num + den MLEs)
+            + max_log_row_count * 10                // GKR round proofs + sumcheck coeffs
+            + num_chips * 200                       // chip evaluations (generous width estimate)
+            + max_log_row_count * 5                 // zerocheck sumcheck coefficients
+            + num_chips * 200; // zerocheck opened values
+
+        let mask_length = compute_mask_length::<VeilGC, _>(
+            |ctx| {
+                let oracle = ctx.read_oracle(num_encoding_vars, log_num_polys as u32).unwrap();
+                // Read the estimated sub-protocol transcript elements
+                let mut transcript = vec![];
+                for _ in 0..estimated_transcript_reads {
+                    if let Ok(v) = ctx.read_one() {
+                        transcript.push(v);
+                    }
+                }
+                // Sample the evaluation point RLC coordinates
+                let point = ReadingCtx::sample_point(ctx, log_num_polys as u32);
+                let eval = ctx.read_one().unwrap();
+                (oracle, transcript, point, eval)
+            },
+            |(oracle, _transcript, point, eval), ctx: &mut slop_veil::zk::MaskCounter<VeilGC>| {
+                ctx.assert_mle_eval(oracle, point, eval);
+            },
+        );
+
+        // Initialize VEIL prover context with a single PCS prover.
+        // Only ONE commitment is generated — no double-commit.
+        let (pcs_prover, _pcs_verifier) =
+            initialize_zk_prover_and_verifier::<VeilGC, MK>(1, num_encoding_vars);
+
+        let mut veil_ctx: StackedPcsZkProverCtx<VeilGC, MK> =
+            ZkProverCtx::initialize_with_pcs_only_lin(mask_length, pcs_prover, rng);
+
+        // Commit the stacked trace MLE via the high-level context.
+        // Takes a reference — the original MLE is preserved for later evaluation.
+        let veil_commit = veil_ctx
+            .commit_mle(&stacked_mle, log_num_polys as u32, rng)
+            .map_err(|e| VeilProvingError::CommitmentFailed(format!("{e:?}")))?;
+
+        // Extract the masked digest from the VEIL prover context.
+        // This is the same digest that VEIL observed into its own internal challenger.
+        let masked_digest = veil_ctx.committed_digests().into_iter().next().ok_or_else(|| {
+            VeilProvingError::CommitmentFailed("no commitment registered in VEIL context".into())
+        })?;
+
+        tracing::info!("[ZK] VEIL masked commitment generated successfully");
+
+        // === Step 3: Absorb both commitments into the Fiat-Shamir challenger ===
+        // VEIL masked commitment first (binds ZK proof to transcript).
+        for &elem in masked_digest.iter() {
+            challenger.observe(elem);
+        }
+        // Standard commitment (for LogUp-GKR / zerocheck compatibility).
         challenger.observe(main_commit);
 
-        if veil_masked_commit_ok {
-            tracing::info!("[ZK] VEIL masked commitment generated (parallel to standard)");
-        }
-
-        // Observe the number of chips.
+        // Observe the number of chips and chip metadata.
         challenger.observe(GC::F::from_canonical_usize(shard_chips.len()));
-
         for chips in shard_chips.iter() {
             let num_real_entries = traces.get(chips.air.name()).unwrap().num_real_entries();
             challenger.observe(GC::F::from_canonical_usize(num_real_entries));
@@ -989,7 +1015,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
             }
         }
 
-        // LogUp-GKR proof (unchanged - operates on original traces)
+        // === Step 4: LogUp-GKR proof (unchanged) ===
         let logup_gkr_proof = {
             let _span = tracing::debug_span!("[ZK] logup gkr proof").entered();
             self.inner.logup_gkr_prover.prove_logup_gkr(
@@ -1004,7 +1030,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         let batching_challenge = challenger.sample_ext_element::<GC::EF>();
         let gkr_opening_batch_challenge = challenger.sample_ext_element::<GC::EF>();
 
-        // Zerocheck proof (unchanged)
+        // === Step 5: Zerocheck proof (unchanged) ===
         let (shard_open_values, zerocheck_partial_sumcheck_proof) = {
             let _span = tracing::debug_span!("[ZK] zerocheck").entered();
             self.zerocheck(
@@ -1019,7 +1045,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
             )
         };
 
-        // Evaluation proof (standard - full VEIL replacement requires deeper integration)
+        // === Step 6: Evaluation proof (standard) ===
         let evaluation_point = zerocheck_partial_sumcheck_proof.point_and_eval.0.clone();
         let mut preprocessed_evaluation_claims: Option<Evaluations<GC::EF, CpuBackend>> = None;
         let mut main_evaluation_claims = Evaluations::new(vec![]);
@@ -1051,22 +1077,111 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
             .chain(once(main_data))
             .collect::<Rounds<_>>();
 
-        // === VEIL INTERVENTION POINT 2: Evaluation proof ===
-        // Currently using standard evaluation proof for full compatibility.
-        // Full VEIL integration would replace this with
-        // zk_basefold_prover.zk_generate_eval_proof_for_mles()
         let evaluation_proof = {
-            let _span = tracing::debug_span!("[ZK] prove evaluation claims").entered();
+            let _span = tracing::debug_span!("[ZK] prove evaluation claims (standard)").entered();
             self.inner
                 .pcs_prover
                 .prove_trusted_evaluations(
-                    evaluation_point,
+                    evaluation_point.clone(),
                     round_evaluation_claims,
                     round_prover_data,
                     &mut challenger,
                 )
                 .unwrap()
         };
+
+        // === Step 6.5: VEIL masking of LogUp-GKR and zerocheck transcript ===
+        // Feed all trace-leaking values from the sub-protocols into the VEIL
+        // transcript via send_values(). This ensures the VEIL mask-proof covers
+        // these values, preventing information leakage about the witness.
+        {
+            let _span = tracing::debug_span!("[ZK] mask sub-protocol transcript").entered();
+
+            // LogUp-GKR circuit output (numerator + denominator MLE traces)
+            let num_slice = logup_gkr_proof.circuit_output.numerator.guts().as_buffer().as_slice();
+            let den_slice =
+                logup_gkr_proof.circuit_output.denominator.guts().as_buffer().as_slice();
+            veil_ctx.send_values(num_slice);
+            veil_ctx.send_values(den_slice);
+
+            // LogUp-GKR round proofs (4 extension field elements per round)
+            for round in &logup_gkr_proof.round_proofs {
+                veil_ctx.send_values(&[
+                    round.numerator_0,
+                    round.numerator_1,
+                    round.denominator_0,
+                    round.denominator_1,
+                ]);
+                // Sumcheck univariate polynomial coefficients
+                for uni_poly in &round.sumcheck_proof.univariate_polys {
+                    veil_ctx.send_values(&uni_poly.coefficients);
+                }
+            }
+
+            // LogUp-GKR chip evaluations (main + preprocessed trace values)
+            for chip_eval in logup_gkr_proof.logup_evaluations.chip_openings.values() {
+                let main_vals =
+                    chip_eval.main_trace_evaluations.evaluations().as_buffer().as_slice();
+                veil_ctx.send_values(main_vals);
+                if let Some(prep) = &chip_eval.preprocessed_trace_evaluations {
+                    let prep_vals = prep.evaluations().as_buffer().as_slice();
+                    veil_ctx.send_values(prep_vals);
+                }
+            }
+
+            // Zerocheck sumcheck univariate polynomial coefficients
+            for uni_poly in &zerocheck_partial_sumcheck_proof.univariate_polys {
+                veil_ctx.send_values(&uni_poly.coefficients);
+            }
+
+            // Zerocheck opened values (per-chip main + preprocessed evaluations)
+            for chip_vals in shard_open_values.chips.values() {
+                veil_ctx.send_values(&chip_vals.main.local);
+                if !chip_vals.preprocessed.local.is_empty() {
+                    veil_ctx.send_values(&chip_vals.preprocessed.local);
+                }
+            }
+
+            tracing::info!("[ZK] Sub-protocol transcript masked via VEIL");
+        }
+
+        // === Step 7: VEIL evaluation proof ===
+        // Use the STARK's evaluation point (from zerocheck) as the VEIL evaluation
+        // point. This ties the VEIL proof to the STARK proof: both prove about the
+        // same polynomial at the same point.
+        //
+        // The STARK evaluation_point has dimension = max_log_row_count (row variables).
+        // The VEIL stacked MLE has dimension = num_encoding_vars + log_num_polys.
+        // We sample VEIL-internal coordinates for the stacking dimension
+        // (log_num_polys variables) while using the STARK point for the encoding
+        // dimension (row variables). This ensures the VEIL proof is bound to the
+        // same evaluation point as the STARK constraints.
+        let zk_proof = {
+            let _span = tracing::debug_span!("[ZK] prove VEIL evaluation").entered();
+
+            // Construct the VEIL evaluation point by combining:
+            // - The STARK evaluation_point (row variables, from zerocheck)
+            // - RLC coordinates sampled from VEIL's challenger (column variables)
+            // This binds the VEIL proof to the same row-space as the STARK proof.
+            let mut veil_point: Point<<VeilGC as slop_challenger::IopCtx>::EF> =
+                evaluation_point.iter().copied().collect::<Point<_>>();
+            // Sample log_num_polys additional coordinates from VEIL's challenger
+            // for the column (stacking) dimension.
+            let rlc_point = veil_ctx.sample_point(log_num_polys as u32);
+            veil_point.extend(&rlc_point);
+
+            // Evaluate the stacked MLE at the combined point.
+            let eval_value = stacked_mle.eval_at(&veil_point)[0];
+            let eval = veil_ctx.send_value(eval_value);
+
+            // Assert MLE evaluation (adds PCS constraint to VEIL proof).
+            veil_ctx.assert_mle_eval(veil_commit, veil_point, eval);
+
+            // Generate the ZK proof.
+            veil_ctx.prove(rng)
+        };
+
+        tracing::info!("[ZK] VEIL ZK proof generated successfully");
 
         let proof = ShardProof {
             main_commitment: main_commit,
@@ -1075,12 +1190,91 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
             evaluation_proof,
             zerocheck_proof: zerocheck_partial_sumcheck_proof,
             public_values,
+            veil_proof: Some(crate::VeilMaskingProof {
+                masked_commitment: masked_digest,
+                zk_proof,
+                num_encoding_vars,
+                log_num_polys: log_num_polys as u32,
+            }),
         };
 
         tracing::info!("[ZK] Shard proof with VEIL masking complete");
 
-        (proof, permit)
+        Ok((proof, permit))
     }
+}
+
+/// Error type for VEIL ZK proving operations.
+#[derive(Debug, thiserror::Error)]
+pub enum VeilProvingError {
+    /// VEIL masked commitment generation failed.
+    #[error("VEIL commitment failed: {0}")]
+    CommitmentFailed(String),
+    /// VEIL evaluation proof generation failed.
+    #[error("VEIL evaluation proof failed: {0}")]
+    EvalProofFailed(String),
+    /// VEIL constraint proof generation failed.
+    #[error("VEIL constraint proof failed: {0}")]
+    ConstraintProofFailed(String),
+}
+
+/// Stack all chip traces into a single MLE suitable for VEIL commitment.
+///
+/// Unlike the original broken flatten (which discarded column structure into a 1-column MLE),
+/// this function preserves the multi-column structure of each chip's trace:
+///
+/// - Each chip contributes its columns (from its `PaddedMle`'s inner tensor).
+/// - All columns across all chips are collected.
+/// - Column count is padded to the next power of 2 (`2^log_num_polys`).
+/// - Row count is the maximum across all columns, padded to a power of 2.
+/// - The result is a row-major `Mle` with shape `[padded_rows, padded_cols]`.
+fn stack_traces_for_veil<F: Field>(
+    traces: &Traces<F, CpuBackend>,
+) -> (slop_multilinear::Mle<F, CpuBackend>, usize) {
+    use slop_matrix::dense::RowMajorMatrix;
+    use slop_multilinear::Mle;
+
+    // Collect all columns from all chips, preserving structure.
+    let mut all_columns: Vec<(usize, Vec<F>)> = Vec::new(); // (original_num_rows, column_data)
+
+    for padded_mle in traces.values() {
+        if let Some(mle) = padded_mle.inner() {
+            let buffer = mle.guts().as_buffer();
+            let slice = buffer.as_slice();
+            let width = mle.num_polynomials();
+            let num_rows = if width > 0 { slice.len() / width } else { 0 };
+            for col_idx in 0..width {
+                let col: Vec<F> = (0..num_rows).map(|row| slice[row * width + col_idx]).collect();
+                all_columns.push((num_rows, col));
+            }
+        }
+    }
+
+    if all_columns.is_empty() {
+        // Degenerate case: no traces. Return a minimal MLE.
+        let mle = Mle::new(RowMajorMatrix::new(vec![F::zero()], 1).into());
+        return (mle, 0);
+    }
+
+    // Determine dimensions.
+    let num_cols = all_columns.len();
+    let log_num_polys =
+        if num_cols <= 1 { 0 } else { num_cols.next_power_of_two().trailing_zeros() as usize };
+    let padded_num_cols = 1usize << log_num_polys;
+
+    let max_rows = all_columns.iter().map(|(n, _)| *n).max().unwrap_or(0);
+    let padded_rows = if max_rows == 0 { 1 } else { max_rows.next_power_of_two() };
+
+    // Build row-major matrix: data[row * padded_num_cols + col].
+    let mut data = vec![F::zero(); padded_rows * padded_num_cols];
+    for (col_idx, (_num_rows, col_data)) in all_columns.iter().enumerate() {
+        for (row_idx, &val) in col_data.iter().enumerate() {
+            data[row_idx * padded_num_cols + col_idx] = val;
+        }
+    }
+
+    let mle = Mle::new(RowMajorMatrix::new(data, padded_num_cols).into());
+    (mle, log_num_polys)
 }
 
 /// The shape of the core proof. This and prover setup parameters should entirely determine the

@@ -88,12 +88,7 @@ fn run_zk_stacked_pcs_test(num_encoding_variables: u32, log_num_polynomials: u32
             StackedPcsZkProverContext::initialize_only_lin_constraints(masks_length, &mut rng);
 
         let commitment_index = prover_context
-            .commit_mle(
-                original_mle.clone(),
-                log_num_polynomials as usize,
-                &zk_basefold_prover,
-                &mut rng,
-            )
+            .commit_mle(&original_mle, log_num_polynomials as usize, &zk_basefold_prover, &mut rng)
             .expect("Failed to commit MLEs");
 
         let claim = prover_context.add_value(expected_eval_value);

@@ -194,7 +194,7 @@ fn run_zk_single(
         let mut ctx: StackedPcsZkProverCtx<GC, MK> =
             ZkProverCtx::initialize_with_pcs_only_lin(masks_length, pcs_prover, rng);
 
-        let commit = ctx.commit_mle(original_mle.clone(), log_num_polynomials, rng).unwrap();
+        let commit = ctx.commit_mle(&original_mle, log_num_polynomials, rng).unwrap();
 
         let view = param.prove(mle_ef.clone(), &mut ctx, claim);
         let point: Point<EF> = Point::from(view.point.clone());
@@ -391,8 +391,8 @@ fn run_zk_hadamard(
         let mut ctx: StackedPcsZkProverCtx<GC, MK> =
             ZkProverCtx::initialize_with_pcs(masks_length, pcs_prover, rng);
 
-        let ci_base = ctx.commit_mle(mle_1.clone(), log_num_polynomials, rng).unwrap();
-        let ci_ext = ctx.commit_mle(mle_2.clone(), log_num_polynomials, rng).unwrap();
+        let ci_base = ctx.commit_mle(&mle_1, log_num_polynomials, rng).unwrap();
+        let ci_ext = ctx.commit_mle(&mle_2, log_num_polynomials, rng).unwrap();
 
         let view = param.prove(hadamard_product, &mut ctx, claim);
         let data = HadamardReadData { ci_base, ci_ext, view };

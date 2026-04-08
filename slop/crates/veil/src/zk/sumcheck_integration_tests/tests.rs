@@ -249,7 +249,7 @@ fn test_zk_sumcheck_with_pcs_eval_proof_single_mle() {
         eprintln!("Committing MLE...");
         let commit_start = std::time::Instant::now();
         let commitment_index = prover_context
-            .commit_mle(original_mle, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
+            .commit_mle(&original_mle, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
             .expect("Failed to commit MLEs");
         eprintln!("  Commitment time: {:?}", commit_start.elapsed());
 
@@ -399,11 +399,21 @@ fn test_zk_sumcheck_with_pcs_eval_proof_hadamard_product() {
         let commit_start = std::time::Instant::now();
         // Commit base MLE
         let commitment_index_base = prover_context
-            .commit_mle(original_mle_1, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
+            .commit_mle(
+                &original_mle_1,
+                LOG_NUM_POLYNOMIALS as usize,
+                &zk_basefold_prover,
+                &mut rng,
+            )
             .expect("Failed to commit base MLE");
         // Commit ext MLE
         let commitment_index_ext = prover_context
-            .commit_mle(original_mle_2, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
+            .commit_mle(
+                &original_mle_2,
+                LOG_NUM_POLYNOMIALS as usize,
+                &zk_basefold_prover,
+                &mut rng,
+            )
             .expect("Failed to commit ext MLE");
         eprintln!("  Commitment time: {:?}", commit_start.elapsed());
 
@@ -579,7 +589,7 @@ fn test_zk_sumcheck_with_pcs_eval_proof_batched_single_mles() {
         eprintln!("Committing MLEs...");
         let commit_start = std::time::Instant::now();
         let commitment_indices: Vec<_> = flat_mles
-            .into_iter()
+            .iter()
             .map(|flat_mle| {
                 prover_context
                     .commit_mle(
@@ -808,13 +818,13 @@ fn test_zk_sumcheck_triple_hadamard_with_batched_pcs() {
         eprintln!("Committing MLEs...");
         let commit_start = std::time::Instant::now();
         let commitment_f = prover_context
-            .commit_mle(mle_f, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
+            .commit_mle(&mle_f, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
             .expect("Failed to commit f");
         let commitment_g = prover_context
-            .commit_mle(mle_g, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
+            .commit_mle(&mle_g, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
             .expect("Failed to commit g");
         let commitment_h = prover_context
-            .commit_mle(mle_h, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
+            .commit_mle(&mle_h, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
             .expect("Failed to commit h");
         eprintln!("  Commitment time: {:?}", commit_start.elapsed());
 

@@ -93,6 +93,7 @@ fn create_dummy_recursion_proof(
         zerocheck_proof: PartialSumcheckProof::dummy(),
         opened_values: ShardOpenedValues { chips: BTreeMap::new() },
         evaluation_proof,
+        veil_proof: None,
     };
 
     SP1RecursionProof {

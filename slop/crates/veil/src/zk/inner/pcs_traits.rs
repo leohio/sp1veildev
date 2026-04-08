@@ -63,7 +63,7 @@ pub trait ZkPcsProver<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> {
     /// A tuple of (commitment digest, prover data) or an error.
     fn commit_mle<RNG: rand::CryptoRng + rand::Rng>(
         &self,
-        mle: Mle<GC::F, CpuBackend>,
+        mle: &Mle<GC::F, CpuBackend>,
         log_num_polynomials: usize,
         rng: &mut RNG,
     ) -> Result<(GC::Digest, Self::ProverData), ZkPcsCommitmentError>

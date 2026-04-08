@@ -391,7 +391,7 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>, PD> ZkProverContext<GC, MK, PD> {
     /// when adding evaluation claims, or an error if commitment fails.
     pub fn commit_mle<P, RNG>(
         &mut self,
-        mle: slop_multilinear::Mle<GC::F, slop_alloc::CpuBackend>,
+        mle: &slop_multilinear::Mle<GC::F, slop_alloc::CpuBackend>,
         log_num_polynomials: usize,
         pcs_prover: &P,
         rng: &mut RNG,
@@ -723,7 +723,7 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkPcsProver<GC, MK> for NoPcsProver {
 
     fn commit_mle<RNG: rand::CryptoRng + rand::Rng>(
         &self,
-        _mle: slop_multilinear::Mle<GC::F, slop_alloc::CpuBackend>,
+        _mle: &slop_multilinear::Mle<GC::F, slop_alloc::CpuBackend>,
         _log_num_polynomials: usize,
         _rng: &mut RNG,
     ) -> Result<(GC::Digest, Self::ProverData), super::ZkPcsCommitmentError>

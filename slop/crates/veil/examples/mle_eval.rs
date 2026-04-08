@@ -59,8 +59,7 @@ fn main() {
             ZkProverCtx::initialize_with_pcs_only_lin(mask_length, pcs_prover, &mut rng);
 
         // Commit to p
-        let commit =
-            ctx.commit_mle(p.clone(), LOG_NUM_POLYNOMIALS, &mut rng).expect("failed to commit");
+        let commit = ctx.commit_mle(&p, LOG_NUM_POLYNOMIALS, &mut rng).expect("failed to commit");
         // Get a random point
         let point = ctx.sample_point(NUM_VARIABLES);
 

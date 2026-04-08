@@ -79,5 +79,6 @@ pub fn dummy_shard_proof<A: MachineAir<SP1Field>>(
                 .collect(),
         },
         evaluation_proof,
+        veil_proof: None,
     }
 }

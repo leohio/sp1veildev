@@ -280,9 +280,9 @@ fn main() {
             ZkProverCtx::initialize_with_pcs(mask_length, pcs_prover, &mut rng);
 
         // Commit p, q, r
-        let p_oracle = ctx.commit_mle(p_base, LOG_NUM_POLYNOMIALS, &mut rng).unwrap();
-        let q_oracle = ctx.commit_mle(q_base, LOG_NUM_POLYNOMIALS, &mut rng).unwrap();
-        let r_oracle = ctx.commit_mle(r_base, LOG_NUM_POLYNOMIALS, &mut rng).unwrap();
+        let p_oracle = ctx.commit_mle(&p_base, LOG_NUM_POLYNOMIALS, &mut rng).unwrap();
+        let q_oracle = ctx.commit_mle(&q_base, LOG_NUM_POLYNOMIALS, &mut rng).unwrap();
+        let r_oracle = ctx.commit_mle(&r_base, LOG_NUM_POLYNOMIALS, &mut rng).unwrap();
 
         // Sample the zerocheck random point z_0
         let z_0: Point<EF> = ctx.sample_point(NUM_VARIABLES);

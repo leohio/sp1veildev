@@ -411,14 +411,14 @@ impl<GC: ZkIopCtx<PcsProof = ZkStackedPcsProof<GC>>, MK: ZkMerkleizer<GC>> ZkPcs
 
     fn commit_mle<RNG: rand::CryptoRng + rand::Rng>(
         &self,
-        mle: Mle<GC::F, CpuBackend>,
+        mle: &Mle<GC::F, CpuBackend>,
         log_num_polynomials: usize,
         rng: &mut RNG,
     ) -> Result<(GC::Digest, Self::ProverData), ZkPcsCommitmentError>
     where
         rand::distributions::Standard: rand::distributions::Distribution<GC::F>,
     {
-        // Stack the flat MLE into a multi-row form
+        // Stack the flat MLE into a multi-row form (clones data internally)
         let stacked_mle = super::utils::stack_mle(mle, log_num_polynomials);
 
         // Generate the commitment

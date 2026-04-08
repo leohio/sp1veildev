@@ -9,8 +9,8 @@ use thiserror::Error;
 ///
 /// # Panics
 /// Panics if the MLE's total length is not divisible by `2^log_num_polynomials`.
-pub fn stack_mle<F: Copy + Send + Sync>(mle: Mle<F>, log_num_polynomials: usize) -> Mle<F> {
-    let data = mle.into_guts().into_buffer().into_vec();
+pub fn stack_mle<F: Copy + Send + Sync>(mle: &Mle<F>, log_num_polynomials: usize) -> Mle<F> {
+    let data = mle.guts().as_buffer().as_slice().to_vec();
     Mle::new(RowMajorMatrix::new(data, 1 << log_num_polynomials).into())
 }
 
