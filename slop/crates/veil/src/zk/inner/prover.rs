@@ -308,8 +308,13 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>, PD> ZkProverContext<GC, MK, PD> {
             debugger: super::debug::ConstraintDebugger::new(),
         };
 
-        // Add a dummy constant value to allow for affine constraints
-        inner.transcript.add_values(&[GC::EF::one() + inner.masks[0]]);
+        // Add a dummy constant value to allow for affine constraints.
+        // Observe it into the challenger so the Fiat-Shamir transcript commits to it
+        // before any challenges are derived; this prevents an adversary from adaptively
+        // substituting a different constant-block value after seeing the challenges.
+        let constant_masked = GC::EF::one() + inner.masks[0];
+        inner.challenger.observe_ext_element_slice(&[constant_masked]);
+        inner.transcript.add_values(&[constant_masked]);
         inner.masks_current_index += 1;
 
         Self { inner: Rc::new(RefCell::new(inner)) }
@@ -670,6 +675,13 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>, PD> ZkProverContext<GC, MK, PD> {
         >(
             &mul_vecs[0], &mul_vecs[1], &mul_vecs[2], rng, merkleizer
         );
+
+        // Observe commitment before sampling RLC coefficient (Fiat-Shamir binding:
+        // rlc_coeff must be derived after the commitment is fixed)
+        {
+            let mut inner = self.borrow_mut();
+            inner.challenger.observe(commitment);
+        }
 
         // Sample RLC coefficient
         let rlc_coeff: GC::EF = {

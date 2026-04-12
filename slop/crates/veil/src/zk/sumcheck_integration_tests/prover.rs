@@ -73,6 +73,12 @@ pub fn zk_reduce_sumcheck_to_evaluation_general<GC: ZkIopCtx, MK: ZkMerkleizer<G
     // Decomposing the sumcheck claims into values and indices.
     let claim_values = claims.iter().map(|claim| claim.value()).collect::<Vec<GC::EF>>();
 
+    // Send claimed_sum BEFORE any round polynomials so the verifier observes it before
+    // deriving any round challenges. This matches the ordering enforced in read_proof_from_transcript.
+    let rlc_claimed_sum =
+        claim_values.iter().copied().fold(GC::EF::zero(), |acc, x| acc * lambda + x);
+    let claimed_sum = context.add_value(rlc_claimed_sum);
+
     // The univariate poly messages.  This will be a rlc of the polys' univariate polys.
     let mut univariate_poly_msgs: Vec<Vec<StackedPcsProverValue<GC, MK>>> = vec![];
 
@@ -117,9 +123,6 @@ pub fn zk_reduce_sumcheck_to_evaluation_general<GC: ZkIopCtx, MK: ZkMerkleizer<G
         polys_cursor.iter().map(|poly| poly.get_component_poly_evals()).collect();
     let poly_component_counts =
         component_poly_evals.iter().map(|evals| evals.len()).collect::<Vec<_>>();
-
-    let rlc_claimed_sum = claim_values.into_iter().fold(GC::EF::zero(), |acc, x| acc * lambda + x);
-    let claimed_sum = context.add_value(rlc_claimed_sum);
 
     let rlc_full_eval = evals.into_iter().fold(GC::EF::zero(), |acc, x| acc * lambda + x);
     let total_eval = context.add_value(rlc_full_eval);

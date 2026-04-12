@@ -272,11 +272,13 @@ pub fn zk_dot_product_pre_reveal<GC: IopCtx, ProverData, Code: ZkCode<GC::EF>>(
         in_vecs.iter().map(|v| dot_product(v, dot_vec)).collect();
     let mask_dot_product = dot_product(&masks, dot_vec);
 
-    // Observe first round messages and draw randomness
+    // Observe first round messages and draw randomness.
+    // Commitment is observed first so that rho binds to the committed data
+    // before any prover-asserted values (claimed_dot_products, mask_dot_product).
+    challenger.observe(*commitment);
     challenger.observe_ext_element_slice(dot_vec);
     challenger.observe_ext_element_slice(&claimed_dot_products);
     challenger.observe_ext_element(mask_dot_product);
-    challenger.observe(*commitment);
     let rho: GC::EF = challenger.sample_ext_element();
 
     // Compute RLC via Horner: rlc[i] = in_vecs[0][i] + rho*(in_vecs[1][i] + ... + rho*masks[i])
@@ -368,6 +370,13 @@ pub fn zk_dot_products_proof<
         "All dot_vecs must have the same length as the committed vectors"
     );
 
+    // Observe commitment and all dot_vecs before sampling rlc_coeff so that
+    // the outer RLC challenge binds to both the committed polynomial and the
+    // query vectors (Schwartz-Zippel soundness for batching).
+    challenger.observe(commitment);
+    for dv in dot_vecs {
+        challenger.observe_ext_element_slice(dv);
+    }
     let rlc_coeff: GC::EF = challenger.sample_ext_element();
 
     let (rlc_vec, _) = dot_vecs.iter().skip(1).fold(

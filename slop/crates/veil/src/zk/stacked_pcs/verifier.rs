@@ -108,11 +108,10 @@ where
         }
 
         // Step 1: Read evals from context for each commitment.
-        // Only commitment 0 includes mask column evaluations;
-        // the others only have data column evaluations.
+        // Every commitment includes both data and mask column evaluations.
         let mut per_claim_evals = Vec::with_capacity(num_claims);
-        for j in 0..num_claims {
-            let num_to_read = if j == 0 { num_polys } else { 1 << log_num_polys };
+        for _ in 0..num_claims {
+            let num_to_read = num_polys;
             let Some(evals) = context.read_next(num_to_read) else {
                 return Err(ZkStackedVerifierError::IncorrectShape("Failed to get evals".into()));
             };
@@ -138,7 +137,7 @@ where
         context.challenger().observe_ext_element(rlc_eval_claim);
 
         // Precompute α powers and eq evals
-        let alpha_powers: Vec<GC::EF> = batching_challenge.powers().take(num_claims + 1).collect();
+        let alpha_powers: Vec<GC::EF> = batching_challenge.powers().take(2 * num_claims).collect();
 
         let eq_evals = partial_lagrange_blocking(&rlc_point).into_buffer().into_vec();
         let num_original = 1 << log_num_polys;
@@ -168,11 +167,9 @@ where
                         .sum();
                     combined += alpha_powers[j] * eq_sum;
 
-                    // Only include the mask from commitment 0
-                    if j == 0 {
-                        combined += alpha_powers[num_claims]
-                            * GC::EF::from_base_slice(&row[num_original..]);
-                    }
+                    // Every commitment contributes its own mask with a distinct α power.
+                    combined += alpha_powers[num_claims + j]
+                        * GC::EF::from_base_slice(&row[num_original..]);
                 }
                 combined
             })
@@ -193,7 +190,8 @@ where
                 padding_eval * x_to_unpadded_size
             });
             expected_combined_eval
-                .into_iter()
+                .iter()
+                .copied()
                 .zip(corrections)
                 .map(|(eval, correction)| eval - correction)
                 .collect()
@@ -277,26 +275,28 @@ impl<GC: ZkIopCtx, C: ConstraintContextInnerExt<GC::EF>> ZkProtocolProof<GC, C>
         let num_claims = self.claims.len();
 
         let alpha_powers: Vec<GC::EF> =
-            self.batching_challenge.powers().take(num_claims + 1).collect();
+            self.batching_challenge.powers().take(2 * num_claims).collect();
 
         // Combined RLC constraint:
         // Σ_j α^j * mle_eval(rlc_point, evals_j[0..2^p])
-        //   + α^k * mask_sum_0 == combined_rlc_eval_claim
+        //   + Σ_j α^{k+j} * mask_sum_j == combined_rlc_eval_claim
         //
-        // Build data RLC terms and the single mask term.
-        let mut terms: Vec<(GC::EF, C::Expr)> = Vec::with_capacity(num_claims + 1);
+        // Build data RLC terms and one mask term per commitment.
+        let mut terms: Vec<(GC::EF, C::Expr)> = Vec::with_capacity(2 * num_claims);
         for (j, claim) in self.claims.iter().enumerate() {
             terms.push((
                 alpha_powers[j],
                 C::mle_eval(self.rlc_point.clone(), &claim.evals[0..num_original]),
             ));
         }
-        // Single mask from commitment 0
-        let mask_sum_0 = (0..GC::EF::D)
-            .map(|i| self.claims[0].evals[num_original + i].clone() * GC::EF::monomial(i))
-            .reduce(|acc, term| acc + term)
-            .unwrap();
-        terms.push((alpha_powers[num_claims], mask_sum_0));
+        // Mask contribution from every commitment
+        for (j, claim) in self.claims.iter().enumerate() {
+            let mask_sum = (0..GC::EF::D)
+                .map(|i| claim.evals[num_original + i].clone() * GC::EF::monomial(i))
+                .reduce(|acc, term| acc + term)
+                .unwrap();
+            terms.push((alpha_powers[num_claims + j], mask_sum));
+        }
 
         let mut iter = terms.into_iter();
         let (first_alpha, first_term) = iter.next().unwrap();

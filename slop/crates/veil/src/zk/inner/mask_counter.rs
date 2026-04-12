@@ -166,15 +166,12 @@ impl<GC: ZkIopCtx> ConstraintContextInnerExt<GC::EF> for MaskCounterContext<GC> 
         _point: super::Point<GC::EF>,
     ) {
         let pcs_commitments = self.pcs_commitments.borrow();
-        // Each claim corresponds to evaluating a commitment at a point, which requires reading
-        // the data column evaluations.
+        // Each claim sends data evaluations plus its own mask column evaluations.
         for (commitment_index, _) in claims.iter() {
             let log_num_polys = pcs_commitments[commitment_index.index()];
             let num_data = 1 << log_num_polys;
-            *self.counter.borrow_mut() += num_data;
+            *self.counter.borrow_mut() += num_data + GC::EF::D;
         }
-        // Account for mask column evaluations (only once, from the first commitment)
-        *self.counter.borrow_mut() += GC::EF::D;
     }
 }
 

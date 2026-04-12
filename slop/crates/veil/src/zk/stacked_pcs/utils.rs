@@ -55,6 +55,21 @@ pub fn compute_padding_amount(
         });
     }
     let out64 = b / lambda * correction_factor.recip();
+    let mut result = out64.ceil() as usize;
 
-    Ok(out64.ceil() as usize)
+    // The Taylor expansion is an approximation; verify the exact condition and
+    // increment until it is actually satisfied.
+    let check_security = |q: usize| -> bool {
+        let effective_rho = rho + q as f64 / l;
+        let effective_lambda = -(0.5 + 0.5 * effective_rho).log2();
+        if effective_lambda <= 0.0 {
+            return true; // rate >= 1 means the code is already secure
+        }
+        q as f64 >= b / effective_lambda
+    };
+    while !check_security(result) {
+        result += 1;
+    }
+
+    Ok(result)
 }

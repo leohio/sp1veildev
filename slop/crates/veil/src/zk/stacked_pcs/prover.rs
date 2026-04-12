@@ -247,15 +247,15 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
         let num_original = 1usize << log_num_polys;
 
         // Step 1: For each commitment, evaluate all rows at the inner point and add to transcript.
-        // Only commitment 0 includes mask column evaluations in the transcript;
-        // the others only send data column evaluations (since only one mask is used).
+        // Every commitment sends both data and mask column evaluations so that each
+        // commitment is independently masked, preserving the ZK property for all j.
         let (eval_point_inner, _) = eval_point.split_at(eval_point.dimension() - log_num_polys);
         let mut per_claim_evals_elts = Vec::with_capacity(num_claims);
         let mut per_claim_evals_slice = Vec::with_capacity(num_claims);
-        for (j, mles) in all_mles.iter().enumerate() {
+        for mles in all_mles.iter() {
             let evals = mles[0].eval_at(&eval_point_inner);
             let evals_slice = evals.into_evaluations().into_buffer().into_vec();
-            let num_to_send = if j == 0 { num_original + GC::EF::D } else { num_original };
+            let num_to_send = num_original + GC::EF::D;
             let evals_elts = zkbuilder.add_values(&evals_slice[..num_to_send]);
             per_claim_evals_elts.push(evals_elts);
             per_claim_evals_slice.push(evals_slice);
@@ -280,14 +280,14 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
         // For each commitment j:
         //   data_rlc_j[row] = Σ_i eq(rlc_point, i) * data_col_j_i[row]
         //
-        // combined[row] = Σ_j α^j * data_rlc_j[row] + α^k * mask_0[row]
+        // combined[row] = Σ_j α^j * data_rlc_j[row] + Σ_j α^{k+j} * mask_j[row]
         //
-        // Only one mask is included (from commitment 0) since a single random
-        // polynomial suffices for zero-knowledge.
+        // Each commitment contributes its own mask with a distinct power of α
+        // so that all commitments are independently masked for zero-knowledge.
         let eq_evals = Mle::partial_lagrange(&rlc_point);
         let eq_evals_slice = eq_evals.guts().as_buffer().to_vec();
 
-        let alpha_powers: Vec<GC::EF> = batching_challenge.powers().take(num_claims + 1).collect();
+        let alpha_powers: Vec<GC::EF> = batching_challenge.powers().take(2 * num_claims).collect();
 
         // Total rows = 2^mle_num_vars + query_count (from padding)
         let total_rows = all_mles[0][0].guts().sizes()[0];
@@ -297,8 +297,8 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
             let to_dot_tensor = mles[0].guts();
             let stride = to_dot_tensor.strides()[0];
             let data_alpha = alpha_powers[j];
-            // Only include the mask from the first commitment
-            let include_mask = j == 0;
+            // Each commitment contributes its own mask with a distinct power of α.
+            let mask_alpha = alpha_powers[num_claims + j];
 
             let per_row: Vec<GC::EF> = to_dot_tensor
                 .as_buffer()
@@ -310,10 +310,7 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
                         .map(|(eq, &b)| *eq * GC::EF::from(b))
                         .sum();
                     let mut val = data_alpha * eq_sum;
-                    if include_mask {
-                        val += alpha_powers[num_claims]
-                            * GC::EF::from_base_slice(&chunk[num_original..]);
-                    }
+                    val += mask_alpha * GC::EF::from_base_slice(&chunk[num_original..]);
                     val
                 })
                 .collect();
@@ -346,11 +343,12 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
                 .sum();
             rlc_eval_claim += alpha_powers[j] * eq_sum;
         }
-        // Add the single mask contribution from commitment 0
-        let mask_sum_0: GC::EF = (0..GC::EF::D)
-            .map(|i| GC::EF::monomial(i) * per_claim_evals_slice[0][num_original + i])
-            .sum();
-        rlc_eval_claim += alpha_powers[num_claims] * mask_sum_0;
+        // Add mask contribution from every commitment using its own α power.
+        for (j, evals_slice) in per_claim_evals_slice.iter().enumerate() {
+            let mask_sum: GC::EF =
+                (0..GC::EF::D).map(|i| GC::EF::monomial(i) * evals_slice[num_original + i]).sum();
+            rlc_eval_claim += alpha_powers[num_claims + j] * mask_sum;
+        }
 
         // Step 7: Observe combined padding and eval claim
         {

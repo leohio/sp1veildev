@@ -121,10 +121,13 @@ where
         ));
     }
 
-    // Check shape of revealed evaluations tensor
+    // Check shape of revealed evaluations tensor: both dimensions must match expectations.
+    // The height check (dims[0]) prevents a prover from supplying fewer rows than sampled
+    // indices, which would cause the spot-check loop to terminate early (silently skipping
+    // checks). This mirrors the analogous check in verify_zk_dot_product_reveal.
     let dims = revealed_data.revealed_evals.sizes();
     let expected_width = 5 * d;
-    if dims.len() != 2 || dims[1] != expected_width {
+    if dims.len() != 2 || dims[0] != revealed_indices.len() || dims[1] != expected_width {
         return Err(ZkHadamardProductError::InconsistentProofShape(
             "revealed_evals".to_string(),
             dims.to_vec(),
@@ -253,7 +256,7 @@ where
     let d = <GC::EF as AbstractExtensionField<GC::F>>::D;
     let abc_width = 4 * d;
     let total_width = revealed_data.revealed_evals.sizes()[1]; // 5*d
-    let dot_evals = dot_proof.parameters.evals(1);
+    let dot_evals = hadamard_proof.parameters.evals(1);
     let combined_slice = revealed_data.revealed_evals.as_slice();
 
     let mut extracted = Vec::with_capacity(dot_evals * abc_width);

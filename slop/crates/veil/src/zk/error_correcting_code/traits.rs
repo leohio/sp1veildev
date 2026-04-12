@@ -104,6 +104,10 @@ impl<EF: Clone + Send + Sync, Code: ErrorCorrectingCode<EF> + Clone> CodeParamet
         code_inverse_rate: f64,
         padding_schedule: &[usize],
     ) -> Self {
+        assert!(
+            padding_schedule.iter().all(|&p| p > 0),
+            "padding_schedule must not contain degree 0; a zero degree causes division by zero and omits ZK masking columns"
+        );
         let total_padding = padding_schedule
             .iter()
             .map(|&p| {
@@ -117,7 +121,20 @@ impl<EF: Clone + Send + Sync, Code: ErrorCorrectingCode<EF> + Clone> CodeParamet
         let padded_message_length: usize = message_length + total_padding;
         let zero_padded_message_length = padded_message_length.next_power_of_two();
         let code_length = (zero_padded_message_length as f64 * code_inverse_rate) as usize;
-        let code_log_length = code_length.trailing_zeros() as usize;
+        // Use trailing_zeros on each power-of-two factor separately rather than on code_length
+        // directly. code_length.trailing_zeros() gives the number of trailing zero bits, which
+        // equals floor(log2) only when code_length is itself a power of two. When code_inverse_rate
+        // is not a power of two (e.g. 3.0), code_length is not a power of two and trailing_zeros
+        // yields a value that is too small, causing the verifier to sample query indices from a
+        // range smaller than the actual codeword domain and leaving positions unchecked.
+        // zero_padded_message_length is always a power of two by construction.
+        let code_log_length = zero_padded_message_length.trailing_zeros() as usize
+            + (code_inverse_rate as usize).trailing_zeros() as usize;
+        debug_assert_eq!(
+            code_length,
+            1 << code_log_length,
+            "code_inverse_rate must be a power of two for the proximity-gap argument to be sound"
+        );
 
         Self {
             padded_message_length,
@@ -135,6 +152,10 @@ impl<EF: Clone + Send + Sync, Code: ErrorCorrectingCode<EF> + Clone> CodeParamet
     ///
     /// d > 1 is meaningless for non-multiplicative codes.
     pub fn evals(&self, d: usize) -> usize {
+        assert!(
+            d > 0,
+            "degree d must be at least 1; d=0 causes division by zero and an undefined query count"
+        );
         Code::compute_proximity_gap_parameters(
             self.code_inverse_rate / (d as f64),
             self.security_bits,

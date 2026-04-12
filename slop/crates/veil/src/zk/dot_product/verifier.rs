@@ -59,11 +59,13 @@ pub fn verify_zk_dot_product_pre_reveal<GC: IopCtx, Code: ZkCode<GC::EF>>(
         ));
     }
 
-    // Round 1: observe dot products and commitment, sample RLC coefficient
+    // Round 1: observe commitment first, then prover-asserted values, then sample rho.
+    // Commitment must precede prover-controlled messages so that rho binds to
+    // the committed data before any prover assertions.
+    challenger.observe(*commitment);
     challenger.observe_ext_element_slice(dot_vec);
     challenger.observe_ext_element_slice(&proof.claimed_dot_products);
     challenger.observe_ext_element(proof.mask_dot_product);
-    challenger.observe(*commitment);
     let rho: GC::EF = challenger.sample_ext_element();
 
     // Check RLC dot product via Horner: sum(rho^j * dp_j) + rho^N * mask_dp
@@ -216,7 +218,13 @@ where
         ));
     }
 
-    // Sample RLC coefficient
+    // Observe commitment and all dot_vecs before sampling rlc_coeff so that the
+    // outer RLC challenge binds to the commitment (Schwartz-Zippel soundness).
+    // Must mirror zk_dot_products_proof ordering exactly.
+    challenger.observe(*commitment);
+    for dv in dot_vecs {
+        challenger.observe_ext_element_slice(dv);
+    }
     let rlc_coeff: GC::EF = challenger.sample_ext_element();
 
     // Compute RLC of dot_vecs (same as in prover)

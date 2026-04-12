@@ -152,6 +152,15 @@ impl<GC: ZkIopCtx> ZkProof<GC> {
         let mut challenger = GC::default_challenger();
         challenger.observe(self.proof.mask_commitment);
 
+        // Observe the constant block (block 0, value = 1 + masks[0]) into the challenger.
+        // This mirrors what the prover does in initialize_inner and ensures both parties'
+        // Fiat-Shamir states are in sync before any round challenges are derived.
+        // Without this, an adversary could substitute a different block-0 value after
+        // seeing the challenges, breaking affine constraint soundness.
+        if let Some(block0) = self.transcript.get_values(0) {
+            challenger.observe_ext_element_slice(block0);
+        }
+
         let inner = ZkVerificationContextInner {
             challenger,
             transcript: self.transcript,
@@ -355,6 +364,13 @@ impl<GC: ZkIopCtx> ZkVerificationContext<GC> {
         }
 
         let mul_len = self.borrow().mul_constraints.len();
+
+        // Observe commitment before sampling RLC coefficient (Fiat-Shamir binding:
+        // must match prover order — commitment observed before rlc_coeff is sampled)
+        {
+            let mut inner = self.borrow_mut();
+            inner.challenger.observe(mul_proof.commitment);
+        }
 
         // Sample RLC coefficient (must match prover order)
         let rlc_coeff: GC::EF = {

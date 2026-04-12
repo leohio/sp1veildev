@@ -353,7 +353,9 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
         (GC::Digest, BasefoldProverData<GC::F, MerkleProverData<GC, MK>>),
         BaseFoldConfigProverError<GC, MK>,
     > {
-        // Pad each MLE to the next power of two
+        // Pad each MLE to the next power of two.  Track whether any MLE actually required
+        // padding so we can decide whether to reduce the blowup below.
+        let mut any_padded = false;
         let padded_mles = mles
             .into_iter()
             .map(|mle| {
@@ -371,6 +373,7 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
                     // Already a power of two, no padding needed
                     mle
                 } else {
+                    any_padded = true;
                     // Convert to vector, pad with zeros, and reshape
                     let mut padded_vec = guts.clone().into_buffer().into_vec();
                     padded_vec.resize(padded_num_rows * num_cols, GC::F::zero());
@@ -383,9 +386,14 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
 
         let padded_mles_message: Message<Mle<GC::F, CpuBackend>> = padded_mles.into();
 
-        // Get the configured log_blowup and reduce by 1
+        // Reduce blowup by 1 only when padding actually doubled the row count.
+        // When no MLE was padded (all inputs were already powers of two) the codeword
+        // domain is unchanged, so reducing the blowup would produce a codeword that is
+        // half the expected length, causing the verifier's height check to fail and, in
+        // degenerate cases (log_blowup == 1), reducing the rate to 1 (zero distance).
         let config_log_blowup = self.inner.encoder.config().log_blowup();
-        let reduced_log_blowup = config_log_blowup.saturating_sub(1);
+        let reduced_log_blowup =
+            if any_padded { config_log_blowup.saturating_sub(1) } else { config_log_blowup };
 
         // Encode with reduced blowup
         let encoded_messages = self.encode_with_log_blowup(padded_mles_message, reduced_log_blowup);

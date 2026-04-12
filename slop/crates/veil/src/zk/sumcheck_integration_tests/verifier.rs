@@ -89,6 +89,11 @@ impl<GC: ZkIopCtx, C: ZkCnstrAndReadingCtxInner<GC>> ZkProtocolParameters<GC, C>
         let mut alpha_point: Vec<GC::EF> = vec![];
         let mut univariate_poly_coeffs = vec![];
 
+        // Read claimed_sum BEFORE any round polynomials so it is absorbed into the
+        // Fiat-Shamir state before the first challenge is derived. A prover who can
+        // choose claimed_sum after seeing the challenges can trivially break soundness.
+        let claimed_sum = context.read_one()?;
+
         // Read in univariate polynomials from the proof values and sample alphas
         for _ in 0..self.num_variables {
             let coeffs = context.read_next(self.degree + 1)?;
@@ -99,8 +104,7 @@ impl<GC: ZkIopCtx, C: ZkCnstrAndReadingCtxInner<GC>> ZkProtocolParameters<GC, C>
             univariate_poly_coeffs.push(coeffs);
         }
 
-        // Read in claimed sum and claimed eval
-        let claimed_sum = context.read_one()?;
+        // Read in claimed eval
         let claimed_eval = context.read_one()?;
 
         // Read in and observe component polys
@@ -148,7 +152,7 @@ impl<GC: ZkIopCtx, C: ConstraintContextInnerExt<GC::EF>> ZkProtocolProof<GC, C>
         let alpha = self.point[0];
         let eval_claim_constraint =
             C::poly_eval(&self.univariate_poly_coeffs[(params.num_variables - 1) as usize], alpha)
-                - self.claimed_eval;
+                - self.claimed_eval.clone();
         context.assert_zero(eval_claim_constraint);
 
         // Check that the individual poly evaluations were RLC'ed correctly.
@@ -158,5 +162,54 @@ impl<GC: ZkIopCtx, C: ConstraintContextInnerExt<GC::EF>> ZkProtocolProof<GC, C>
         reversed_claims.reverse();
         let rlc_constraint = C::poly_eval(&reversed_claims, params.lambda) - self.claimed_sum;
         context.assert_zero(rlc_constraint);
+
+        // Constrain component_poly_evals against claimed_eval.
+        //
+        // The prover computes claimed_eval as Horner(composition(evals_i, count_i), lambda),
+        // where composition is:
+        //   - identity for count == 1 (single MLE)
+        //   - product for count == 2 (Hadamard)
+        //
+        // This check closes the sumcheck oracle link: without it a malicious prover can
+        // send arbitrary component_poly_evals that pass the PCS opening while the sumcheck
+        // round polynomials used a different (fabricated) evaluation.
+        if !self.component_poly_evals.is_empty() {
+            let all_single = params.poly_component_counts.iter().all(|&c| c == 1);
+            if all_single {
+                // All single-component polynomials: linear RLC of evaluations == claimed_eval.
+                let per_poly_evals: Vec<C::Expr> =
+                    self.component_poly_evals.iter().map(|v| v[0].clone()).collect();
+                let mut reversed = per_poly_evals;
+                reversed.reverse();
+                let rlc_eval = C::poly_eval(&reversed, params.lambda);
+                context.assert_zero(rlc_eval - self.claimed_eval);
+            } else if params.poly_component_counts.len() == 1
+                && params.poly_component_counts[0] == 2
+            {
+                // Single Hadamard polynomial (f * g == claimed_eval).
+                // Uses assert_a_times_b_equals_c to avoid materializing an extra element.
+                context.assert_a_times_b_equals_c(
+                    self.component_poly_evals[0][0].clone(),
+                    self.component_poly_evals[0][1].clone(),
+                    self.claimed_eval,
+                );
+            } else {
+                // General mixed case: fold each poly's components via multiplication,
+                // then RLC with lambda. The Mul<Expr> impl materializes a fresh element
+                // per product and adds the corresponding multiplicative constraint.
+                let per_poly_evals: Vec<C::Expr> = self
+                    .component_poly_evals
+                    .iter()
+                    .zip(params.poly_component_counts.iter())
+                    .map(|(evals, _count)| {
+                        evals.iter().skip(1).fold(evals[0].clone(), |acc, e| acc * e.clone())
+                    })
+                    .collect();
+                let mut reversed = per_poly_evals;
+                reversed.reverse();
+                let rlc_eval = C::poly_eval(&reversed, params.lambda);
+                context.assert_zero(rlc_eval - self.claimed_eval);
+            }
+        }
     }
 }

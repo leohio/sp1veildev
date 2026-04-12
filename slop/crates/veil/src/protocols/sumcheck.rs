@@ -64,6 +64,12 @@ impl SumcheckParam {
             return Err(SumcheckError::NoVariables);
         }
 
+        // Read claimed_sum BEFORE any round polynomial so that it is absorbed into the
+        // Fiat-Shamir state before the first challenge is derived.  A prover who can choose
+        // claimed_sum after seeing the challenges can trivially satisfy the round-0 consistency
+        // check with any first-round polynomial they like, breaking the sumcheck binding.
+        let claimed_sum = ctx.read_one()?;
+
         let mut alphas = Vec::with_capacity(self.num_variables as usize);
         let mut univariate_poly_coeffs = Vec::with_capacity(self.num_variables as usize);
 
@@ -77,7 +83,6 @@ impl SumcheckParam {
         // Alphas are collected outer-to-inner, reverse for point representation.
         alphas.reverse();
 
-        let claimed_sum = ctx.read_one()?;
         let claimed_eval = ctx.read_one()?;
 
         let component_evals = if self.num_component_evals > 0 {
@@ -106,6 +111,10 @@ impl SumcheckParam {
     ) -> SumcheckView<C> {
         assert!(self.num_variables >= 1);
 
+        // Send claimed_sum FIRST so the verifier observes it before deriving any
+        // round challenges.  This mirrors the ordering enforced in `read()`.
+        let claimed_sum = ctx.send_value(claim);
+
         let mut point = Vec::new();
         let mut univariate_poly_coeffs = Vec::new();
 
@@ -129,8 +138,7 @@ impl SumcheckParam {
         // Point was collected outer-to-inner, reverse to match convention
         point.reverse();
 
-        // Send claimed sum and claimed eval
-        let claimed_sum = ctx.send_value(claim);
+        // Send claimed eval
         let eval = uni_poly.eval_at_point(alpha.into());
         let claimed_eval = ctx.send_value(eval);
 

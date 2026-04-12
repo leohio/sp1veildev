@@ -142,6 +142,9 @@ fn run_standard_single(
         let mut verifier_challenger = GC::default_challenger();
         verifier_challenger.observe(commitment);
 
+        // Bind sumcheck to the public claim: for a single polynomial, claimed_sum == claim.
+        assert_eq!(sumcheck_proof.claimed_sum, claim, "claimed_sum does not match public claim");
+
         partially_verify_sumcheck_proof::<F, EF, _>(
             &sumcheck_proof,
             &mut verifier_challenger,
@@ -194,7 +197,7 @@ fn run_zk_single(
         let mut ctx: StackedPcsZkProverCtx<GC, MK> =
             ZkProverCtx::initialize_with_pcs_only_lin(masks_length, pcs_prover, rng);
 
-        let commit = ctx.commit_mle(&original_mle, log_num_polynomials, rng).unwrap();
+        let commit = ctx.commit_mle(original_mle, log_num_polynomials, rng).unwrap();
 
         let view = param.prove(mle_ef.clone(), &mut ctx, claim);
         let point: Point<EF> = Point::from(view.point.clone());
@@ -328,7 +331,12 @@ fn run_standard_hadamard(
         challenger.observe(commitments[0]);
         challenger.observe(commitments[1]);
 
+        // Sample lambda to advance Fiat-Shamir state (matches prover's reduce_sumcheck_to_evaluation).
         let _lambda: EF = slop_challenger::CanSample::sample(&mut challenger);
+
+        // Bind sumcheck to the public claim: for a single Hadamard claim with any lambda,
+        // the Horner fold over [claim] yields claim regardless of lambda.
+        assert_eq!(sumcheck_proof.claimed_sum, claim, "claimed_sum does not match public claim");
 
         partially_verify_sumcheck_proof::<F, EF, _>(
             &sumcheck_proof,
@@ -338,7 +346,7 @@ fn run_standard_hadamard(
         )
         .unwrap();
 
-        let (eval_point, _) = sumcheck_proof.point_and_eval.clone();
+        let (eval_point, sumcheck_eval_claim) = sumcheck_proof.point_and_eval.clone();
         let round_area =
             (1usize << num_variables).next_multiple_of(1usize << num_encoding_variables);
         let (batch_point, _) =
@@ -357,6 +365,15 @@ fn run_standard_hadamard(
                 &mut challenger,
             )
             .unwrap();
+
+        // Product check: verify f1(r) * f2(r) == sumcheck_eval_claim.
+        // The PCS proof binds batch_evaluations to the committed polynomials, so
+        // evaluating each round's MleEval at batch_point gives the individual f_i(r).
+        let f1_mle: Mle<EF> = (&pcs_proof.batch_evaluations[0]).into_iter().cloned().collect();
+        let f2_mle: Mle<EF> = (&pcs_proof.batch_evaluations[1]).into_iter().cloned().collect();
+        let f1_eval = f1_mle.blocking_eval_at(&batch_point)[0];
+        let f2_eval = f2_mle.blocking_eval_at(&batch_point)[0];
+        assert_eq!(f1_eval * f2_eval, sumcheck_eval_claim, "Hadamard product eval check failed");
 
         verifier_start.elapsed()
     };
@@ -391,8 +408,8 @@ fn run_zk_hadamard(
         let mut ctx: StackedPcsZkProverCtx<GC, MK> =
             ZkProverCtx::initialize_with_pcs(masks_length, pcs_prover, rng);
 
-        let ci_base = ctx.commit_mle(&mle_1, log_num_polynomials, rng).unwrap();
-        let ci_ext = ctx.commit_mle(&mle_2, log_num_polynomials, rng).unwrap();
+        let ci_base = ctx.commit_mle(mle_1, log_num_polynomials, rng).unwrap();
+        let ci_ext = ctx.commit_mle(mle_2, log_num_polynomials, rng).unwrap();
 
         let view = param.prove(hadamard_product, &mut ctx, claim);
         let data = HadamardReadData { ci_base, ci_ext, view };
