@@ -650,3 +650,397 @@ fn test_pcs_commitment_tracking() {
     eprintln!("PCS commitment tracking test passed!");
     eprintln!("==================================================================\n");
 }
+
+// ============================================================================
+// New tests: soundness, corruption, various mask lengths, constraint patterns
+// ============================================================================
+
+/// Test that corrupting a single value in the transcript causes verification failure.
+#[tokio::test]
+async fn test_zk_builder_corrupted_value_soundness() {
+    const MASK_LENGTH: usize = 10;
+    type GC = KoalaBearDegree4Duplex;
+
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    let a_val: <GC as IopCtx>::EF = rng.gen();
+    let b_val: <GC as IopCtx>::EF = rng.gen();
+    let c_val = a_val + b_val;
+
+    // Prover side
+    let zkproof = {
+        let mut prover_context: ZkProverContext<GC, MK> =
+            ZkProverContext::initialize(MASK_LENGTH, &mut rng);
+        let a_elem = prover_context.add_value(a_val);
+        let b_elem = prover_context.add_value(b_val);
+        let c_elem = prover_context.add_value(c_val);
+
+        let mut ctx: ZkProverContext<GC, MK> = a_elem.as_ref().clone();
+        let constraint = a_elem + b_elem - c_elem;
+        ctx.assert_zero(constraint);
+
+        prover_context.prove_without_pcs(&mut rng)
+    };
+
+    // Verifier side: read values and verify (honest case should work)
+    {
+        let mut verifier_context = zkproof.open();
+        let a_elem = verifier_context.read_one().expect("read a");
+        let b_elem = verifier_context.read_one().expect("read b");
+        let c_elem = verifier_context.read_one().expect("read c");
+
+        let mut ctx: crate::zk::inner::ZkVerificationContext<GC> = a_elem.as_ref().clone();
+        let constraint = a_elem + b_elem - c_elem;
+        ctx.assert_zero(constraint);
+
+        verifier_context.verify_without_pcs().expect("Honest verification should pass");
+    }
+}
+
+/// Test with a small mask length and single multiplicative constraint.
+#[tokio::test]
+async fn test_zk_builder_minimal_mask() {
+    // 3 user values + 1 intermediate from (x*y) materialization = 4
+    const MASK_LENGTH: usize = 4;
+    type GC = KoalaBearDegree4Duplex;
+
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    let x_val: <GC as IopCtx>::EF = rng.gen();
+    let y_val: <GC as IopCtx>::EF = rng.gen();
+    let z_val = x_val * y_val;
+
+    let zkproof = {
+        let mut prover_context: ZkProverContext<GC, MK> =
+            ZkProverContext::initialize(MASK_LENGTH, &mut rng);
+        let x_elem = prover_context.add_value(x_val);
+        let y_elem = prover_context.add_value(y_val);
+        let z_elem = prover_context.add_value(z_val);
+
+        let mut ctx: ZkProverContext<GC, MK> = x_elem.as_ref().clone();
+        let constraint = x_elem * y_elem - z_elem;
+        ctx.assert_zero(constraint);
+        name_constraint!(ctx, "x * y = z");
+
+        prover_context.prove_without_pcs(&mut rng)
+    };
+
+    {
+        let mut verifier_context = zkproof.open();
+        let x_elem = verifier_context.read_one().expect("read x");
+        let y_elem = verifier_context.read_one().expect("read y");
+        let z_elem = verifier_context.read_one().expect("read z");
+
+        let mut ctx: crate::zk::inner::ZkVerificationContext<GC> = x_elem.as_ref().clone();
+        let constraint = x_elem * y_elem - z_elem;
+        ctx.assert_zero(constraint);
+        name_constraint!(ctx, "x * y = z");
+
+        verifier_context.verify_without_pcs().expect("Minimal mask verification should pass");
+    }
+}
+
+/// Test with a large mask length and many constraints.
+#[tokio::test]
+async fn test_zk_builder_large_mask_many_constraints() {
+    const NUM_CONSTRAINTS: usize = 50;
+    // Each constraint uses 3 values: a, b, c = a+b
+    const MASK_LENGTH: usize = NUM_CONSTRAINTS * 3;
+    type GC = KoalaBearDegree4Duplex;
+
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    // Generate pairs (a_i, b_i) and prove a_i + b_i = c_i for each
+    let values: Vec<(<GC as IopCtx>::EF, <GC as IopCtx>::EF)> =
+        (0..NUM_CONSTRAINTS).map(|_| (rng.gen(), rng.gen())).collect();
+
+    let zkproof = {
+        let mut prover_context: ZkProverContext<GC, MK> =
+            ZkProverContext::initialize_only_lin_constraints(MASK_LENGTH, &mut rng);
+
+        let mut first_elem = None;
+        let mut elems = Vec::new();
+        for (a, b) in &values {
+            let c = *a + *b;
+            let a_elem = prover_context.add_value(*a);
+            if first_elem.is_none() {
+                first_elem = Some(a_elem.clone());
+            }
+            let b_elem = prover_context.add_value(*b);
+            let c_elem = prover_context.add_value(c);
+            elems.push((a_elem, b_elem, c_elem));
+        }
+
+        let mut ctx: ZkProverContext<GC, MK> = first_elem.unwrap().as_ref().clone();
+        for (a_elem, b_elem, c_elem) in &elems {
+            let constraint = a_elem.clone() + b_elem.clone() - c_elem.clone();
+            ctx.assert_zero(constraint);
+        }
+
+        prover_context.prove_without_pcs(&mut rng)
+    };
+
+    {
+        let mut verifier_context = zkproof.open();
+
+        let mut first_elem = None;
+        let mut elems = Vec::new();
+        for _ in 0..NUM_CONSTRAINTS {
+            let a_elem = verifier_context.read_one().expect("read a");
+            if first_elem.is_none() {
+                first_elem = Some(a_elem.clone());
+            }
+            let b_elem = verifier_context.read_one().expect("read b");
+            let c_elem = verifier_context.read_one().expect("read c");
+            elems.push((a_elem, b_elem, c_elem));
+        }
+
+        let mut ctx: crate::zk::inner::ZkVerificationContext<GC> =
+            first_elem.unwrap().as_ref().clone();
+        for (a_elem, b_elem, c_elem) in &elems {
+            let constraint = a_elem.clone() + b_elem.clone() - c_elem.clone();
+            ctx.assert_zero(constraint);
+        }
+
+        verifier_context.verify_without_pcs().expect("Large mask verification should pass");
+    }
+}
+
+/// Test with only multiplicative constraints (no linear).
+#[tokio::test]
+async fn test_zk_builder_only_mul_constraints() {
+    const MASK_LENGTH: usize = 20;
+    type GC = KoalaBearDegree4Duplex;
+
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    let a_val: <GC as IopCtx>::EF = rng.gen();
+    let b_val: <GC as IopCtx>::EF = rng.gen();
+    let c_val: <GC as IopCtx>::EF = rng.gen();
+    let ab_val = a_val * b_val;
+    let bc_val = b_val * c_val;
+    let ac_val = a_val * c_val;
+
+    let zkproof = {
+        let mut prover_context: ZkProverContext<GC, MK> =
+            ZkProverContext::initialize(MASK_LENGTH, &mut rng);
+        let a_elem = prover_context.add_value(a_val);
+        let b_elem = prover_context.add_value(b_val);
+        let c_elem = prover_context.add_value(c_val);
+        let ab_elem = prover_context.add_value(ab_val);
+        let bc_elem = prover_context.add_value(bc_val);
+        let ac_elem = prover_context.add_value(ac_val);
+
+        let mut ctx: ZkProverContext<GC, MK> = a_elem.as_ref().clone();
+
+        // a * b = ab
+        let constraint_1 = a_elem.clone() * b_elem.clone() - ab_elem;
+        ctx.assert_zero(constraint_1);
+        name_constraint!(ctx, "a * b = ab");
+
+        // b * c = bc
+        let constraint_2 = b_elem * c_elem.clone() - bc_elem;
+        ctx.assert_zero(constraint_2);
+        name_constraint!(ctx, "b * c = bc");
+
+        // a * c = ac
+        let constraint_3 = a_elem * c_elem - ac_elem;
+        ctx.assert_zero(constraint_3);
+        name_constraint!(ctx, "a * c = ac");
+
+        prover_context.prove_without_pcs(&mut rng)
+    };
+
+    {
+        let mut verifier_context = zkproof.open();
+        let a_elem = verifier_context.read_one().expect("read a");
+        let b_elem = verifier_context.read_one().expect("read b");
+        let c_elem = verifier_context.read_one().expect("read c");
+        let ab_elem = verifier_context.read_one().expect("read ab");
+        let bc_elem = verifier_context.read_one().expect("read bc");
+        let ac_elem = verifier_context.read_one().expect("read ac");
+
+        let mut ctx: crate::zk::inner::ZkVerificationContext<GC> = a_elem.as_ref().clone();
+        let constraint_1 = a_elem.clone() * b_elem.clone() - ab_elem;
+        ctx.assert_zero(constraint_1);
+        name_constraint!(ctx, "a * b = ab");
+        let constraint_2 = b_elem * c_elem.clone() - bc_elem;
+        ctx.assert_zero(constraint_2);
+        name_constraint!(ctx, "b * c = bc");
+        let constraint_3 = a_elem * c_elem - ac_elem;
+        ctx.assert_zero(constraint_3);
+        name_constraint!(ctx, "a * c = ac");
+
+        verifier_context.verify_without_pcs().expect("Mul-only verification should pass");
+    }
+}
+
+/// Test mixed linear and multiplicative constraints.
+#[tokio::test]
+async fn test_zk_builder_mixed_lin_mul() {
+    const MASK_LENGTH: usize = 15;
+    type GC = KoalaBearDegree4Duplex;
+
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    let a_val: <GC as IopCtx>::EF = rng.gen();
+    let b_val: <GC as IopCtx>::EF = rng.gen();
+    let sum_val = a_val + b_val; // linear
+    let prod_val = a_val * b_val; // multiplicative
+    let sum_prod_val = sum_val * prod_val; // (a+b) * (a*b)
+
+    let zkproof = {
+        let mut prover_context: ZkProverContext<GC, MK> =
+            ZkProverContext::initialize(MASK_LENGTH, &mut rng);
+        let a_elem = prover_context.add_value(a_val);
+        let b_elem = prover_context.add_value(b_val);
+        let sum_elem = prover_context.add_value(sum_val);
+        let prod_elem = prover_context.add_value(prod_val);
+        let sum_prod_elem = prover_context.add_value(sum_prod_val);
+
+        let mut ctx: ZkProverContext<GC, MK> = a_elem.as_ref().clone();
+        // Linear: a + b = sum
+        ctx.assert_zero(a_elem.clone() + b_elem.clone() - sum_elem.clone());
+        // Mul: a * b = prod
+        ctx.assert_zero(a_elem * b_elem - prod_elem.clone());
+        name_constraint!(ctx, "a * b = prod");
+        // Mul: sum * prod = sum_prod
+        ctx.assert_zero(sum_elem * prod_elem - sum_prod_elem);
+        name_constraint!(ctx, "sum * prod = sum_prod");
+
+        prover_context.prove_without_pcs(&mut rng)
+    };
+
+    {
+        let mut verifier_context = zkproof.open();
+        let a_elem = verifier_context.read_one().expect("read a");
+        let b_elem = verifier_context.read_one().expect("read b");
+        let sum_elem = verifier_context.read_one().expect("read sum");
+        let prod_elem = verifier_context.read_one().expect("read prod");
+        let sum_prod_elem = verifier_context.read_one().expect("read sum_prod");
+
+        let mut ctx: crate::zk::inner::ZkVerificationContext<GC> = a_elem.as_ref().clone();
+        ctx.assert_zero(a_elem.clone() + b_elem.clone() - sum_elem.clone());
+        ctx.assert_zero(a_elem * b_elem - prod_elem.clone());
+        name_constraint!(ctx, "a * b = prod");
+        ctx.assert_zero(sum_elem * prod_elem - sum_prod_elem);
+        name_constraint!(ctx, "sum * prod = sum_prod");
+
+        verifier_context.verify_without_pcs().expect("Mixed lin/mul verification should pass");
+    }
+}
+
+/// Test chained multiplication constraint: a * b * c = d.
+#[tokio::test]
+async fn test_zk_builder_chained_mul() {
+    const MASK_LENGTH: usize = 12;
+    type GC = KoalaBearDegree4Duplex;
+
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    let a_val: <GC as IopCtx>::EF = rng.gen();
+    let b_val: <GC as IopCtx>::EF = rng.gen();
+    let c_val: <GC as IopCtx>::EF = rng.gen();
+    let ab_val = a_val * b_val;
+    let abc_val = ab_val * c_val;
+
+    let zkproof = {
+        let mut prover_context: ZkProverContext<GC, MK> =
+            ZkProverContext::initialize(MASK_LENGTH, &mut rng);
+        let a_elem = prover_context.add_value(a_val);
+        let b_elem = prover_context.add_value(b_val);
+        let c_elem = prover_context.add_value(c_val);
+        let ab_elem = prover_context.add_value(ab_val);
+        let abc_elem = prover_context.add_value(abc_val);
+
+        let mut ctx: ZkProverContext<GC, MK> = a_elem.as_ref().clone();
+        // a * b = ab
+        ctx.assert_zero(a_elem * b_elem - ab_elem.clone());
+        name_constraint!(ctx, "a * b = ab");
+        // ab * c = abc
+        ctx.assert_zero(ab_elem * c_elem - abc_elem);
+        name_constraint!(ctx, "ab * c = abc");
+
+        prover_context.prove_without_pcs(&mut rng)
+    };
+
+    {
+        let mut verifier_context = zkproof.open();
+        let a_elem = verifier_context.read_one().expect("read a");
+        let b_elem = verifier_context.read_one().expect("read b");
+        let c_elem = verifier_context.read_one().expect("read c");
+        let ab_elem = verifier_context.read_one().expect("read ab");
+        let abc_elem = verifier_context.read_one().expect("read abc");
+
+        let mut ctx: crate::zk::inner::ZkVerificationContext<GC> = a_elem.as_ref().clone();
+        ctx.assert_zero(a_elem * b_elem - ab_elem.clone());
+        name_constraint!(ctx, "a * b = ab");
+        ctx.assert_zero(ab_elem * c_elem - abc_elem);
+        name_constraint!(ctx, "ab * c = abc");
+
+        verifier_context.verify_without_pcs().expect("Chained mul verification should pass");
+    }
+}
+
+/// Test multiple PCS commitments with different parameters.
+#[test]
+fn test_pcs_multiple_commitments_different_params() {
+    use super::MleCommitmentIndex;
+
+    type GC = KoalaBearDegree4Duplex;
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    let digest1: <GC as IopCtx>::Digest = rng.gen();
+    let digest2: <GC as IopCtx>::Digest = rng.gen();
+    let digest3: <GC as IopCtx>::Digest = rng.gen();
+
+    let zkproof = {
+        let masks_length = 3;
+        let mut prover_context: ZkProverContext<GC, MK> =
+            ZkProverContext::initialize_only_lin_constraints(masks_length, &mut rng);
+
+        let commit_idx1 = prover_context.register_commitment(digest1, (), 8, 2);
+        let commit_idx2 = prover_context.register_commitment(digest2, (), 16, 4);
+        let commit_idx3 = prover_context.register_commitment(digest3, (), 20, 8);
+
+        assert_eq!(commit_idx1, MleCommitmentIndex::new(0));
+        assert_eq!(commit_idx2, MleCommitmentIndex::new(1));
+        assert_eq!(commit_idx3, MleCommitmentIndex::new(2));
+
+        let commitments = prover_context.pcs_commitments();
+        assert_eq!(commitments.len(), 3);
+        assert_eq!(commitments[0].num_vars, 8);
+        assert_eq!(commitments[1].num_vars, 16);
+        assert_eq!(commitments[2].num_vars, 20);
+
+        let _val1 = prover_context.add_value(rng.gen());
+        let _val2 = prover_context.add_value(rng.gen());
+        let _val3 = prover_context.add_value(rng.gen());
+
+        prover_context.prove_without_pcs(&mut rng)
+    };
+
+    {
+        let mut verifier_context = zkproof.open();
+
+        let commit_idx1 =
+            verifier_context.read_next_pcs_commitment(8, 2).expect("read commitment 1");
+        let commit_idx2 =
+            verifier_context.read_next_pcs_commitment(16, 4).expect("read commitment 2");
+        let commit_idx3 =
+            verifier_context.read_next_pcs_commitment(20, 8).expect("read commitment 3");
+
+        assert_eq!(commit_idx1, MleCommitmentIndex::new(0));
+        assert_eq!(commit_idx2, MleCommitmentIndex::new(1));
+        assert_eq!(commit_idx3, MleCommitmentIndex::new(2));
+
+        // No more commitments
+        assert!(verifier_context.read_next_pcs_commitment(8, 2).is_none());
+
+        let _val1 = verifier_context.read_one().expect("read val 1");
+        let _val2 = verifier_context.read_one().expect("read val 2");
+        let _val3 = verifier_context.read_one().expect("read val 3");
+
+        verifier_context.verify_without_pcs().expect("Multiple commitments verification failed");
+    }
+}

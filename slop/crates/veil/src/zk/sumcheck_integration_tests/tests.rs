@@ -130,9 +130,11 @@ fn test_zk_sumcheck() {
         let now = std::time::Instant::now();
 
         // Starting the ZK proof
+        // Use initialize (with mul support) because build_constraints now emits a
+        // multiplicative constraint (f * g == claimed_eval) for the Hadamard product check.
         let masks_length = compute_mask_length::<GC, _, _, _>(read_all, build_all_constraints);
         let mut prover_context: StackedPcsZkProverContext<GC, MK> =
-            StackedPcsZkProverContext::initialize_only_lin_constraints(masks_length, &mut rng);
+            StackedPcsZkProverContext::initialize(masks_length, &mut rng);
 
         // Generating sumcheck proof
         let claim = prover_context.add_value(claim_value);
@@ -542,6 +544,8 @@ fn test_zk_sumcheck_with_pcs_eval_proof_batched_single_mles() {
         ),
         ctx: &mut C,
     ) {
+        let lambda = sumcheck_data.parameters.lambda;
+
         // Add PCS eval claims for each MLE
         for (i, commitment_index) in commitment_indices.iter().enumerate() {
             ctx.assert_mle_eval(
@@ -550,6 +554,15 @@ fn test_zk_sumcheck_with_pcs_eval_proof_batched_single_mles() {
                 sumcheck_data.component_poly_evals[i][0].clone(),
             );
         }
+
+        // Assert that the RLC of per-polynomial evaluations matches claimed_eval.
+        // For single-component polynomials, component_poly_evals[i][0] == f_i(r), so
+        // rlc(f_0(r), ..., f_{n-1}(r), lambda) must equal claimed_eval.
+        let mut reversed_evals: Vec<C::Expr> =
+            sumcheck_data.component_poly_evals.iter().map(|e| e[0].clone()).collect();
+        reversed_evals.reverse();
+        let rlc_eval = C::poly_eval(&reversed_evals, lambda);
+        ctx.assert_zero(rlc_eval - sumcheck_data.claimed_eval.clone());
 
         // Build sumcheck constraints
         sumcheck_data.build_constraints();
@@ -881,4 +894,407 @@ fn test_zk_sumcheck_triple_hadamard_with_batched_pcs() {
     }
 
     eprintln!("\n=== TEST PASSED ===");
+}
+
+// ============================================================================
+// New tests: different configurations, smaller dimensions, single MLE variants
+// ============================================================================
+
+/// Test sumcheck with smaller dimensions (10 encoding vars, 4 stacking).
+#[test]
+fn test_zk_sumcheck_with_pcs_small_dimensions() {
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    type GC = KoalaBearDegree4Duplex;
+
+    const NUM_ENCODING_VARIABLES: u32 = 10;
+    const LOG_NUM_POLYNOMIALS: u32 = 4;
+    const NUM_VARIABLES: u32 = LOG_NUM_POLYNOMIALS + NUM_ENCODING_VARIABLES;
+
+    fn read_all<GC: ZkIopCtx, C: ZkCnstrAndReadingCtxInner<GC>>(
+        context: &mut C,
+    ) -> (MleCommitmentIndex, ZkPartialSumcheckProof<GC, C>) {
+        let commitment_index = context
+            .read_next_pcs_commitment(NUM_ENCODING_VARIABLES as usize, LOG_NUM_POLYNOMIALS as usize)
+            .unwrap();
+        let claimed_sum_index = context.read_one().unwrap();
+        let sumcheck_data =
+            ZkPartialSumcheckParameters::basic_sumcheck(NUM_VARIABLES, claimed_sum_index)
+                .read_proof_from_transcript(context)
+                .unwrap();
+        (commitment_index, sumcheck_data)
+    }
+
+    fn build_all_constraints<GC: ZkIopCtx, C: ConstraintContextInnerExt<GC::EF>>(
+        (commitment_index, sumcheck_data): (MleCommitmentIndex, ZkPartialSumcheckProof<GC, C>),
+        ctx: &mut C,
+    ) {
+        ctx.assert_mle_eval(
+            commitment_index,
+            sumcheck_data.point.clone().into(),
+            sumcheck_data.claimed_eval.clone(),
+        );
+        sumcheck_data.build_constraints();
+    }
+
+    let (original_mle, mle_ef, claim) = generate_random_mle::<GC>(&mut rng, NUM_VARIABLES);
+
+    let (zk_basefold_prover, zk_stacked_verifier) =
+        initialize_zk_prover_and_verifier::<GC, MK>(1, NUM_ENCODING_VARIABLES);
+
+    let zkproof = {
+        let masks_length = compute_mask_length::<GC, _, _, _>(read_all, build_all_constraints);
+        let mut prover_context: StackedPcsZkProverContext<GC, MK> =
+            StackedPcsZkProverContext::initialize_only_lin_constraints(masks_length, &mut rng);
+
+        let commitment_index = prover_context
+            .commit_mle(&original_mle, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
+            .expect("Failed to commit MLE");
+
+        let sum_claim = prover_context.add_value(claim);
+        let (_, sumcheck_constraint_data) =
+            zk_reduce_sumcheck_to_evaluation(mle_ef, &mut prover_context, sum_claim);
+
+        build_all_constraints((commitment_index, sumcheck_constraint_data), &mut prover_context);
+        prover_context.prove(&mut rng, Some(&zk_basefold_prover))
+    };
+
+    {
+        let mut context: StackedPcsZkVerificationContext<GC> = zkproof.open();
+        let (commitment_index, sumcheck_data) = read_all::<GC, _>(&mut context);
+        build_all_constraints((commitment_index, sumcheck_data), &mut context);
+        context.verify(Some(&zk_stacked_verifier)).expect("Small dimensions verification failed");
+    }
+}
+
+/// Test sumcheck with large encoding vars and small stacking (20, 4).
+#[test]
+fn test_zk_sumcheck_with_pcs_large_encoding() {
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    type GC = KoalaBearDegree4Duplex;
+
+    const NUM_ENCODING_VARIABLES: u32 = 20;
+    const LOG_NUM_POLYNOMIALS: u32 = 4;
+    const NUM_VARIABLES: u32 = LOG_NUM_POLYNOMIALS + NUM_ENCODING_VARIABLES;
+
+    fn read_all<GC: ZkIopCtx, C: ZkCnstrAndReadingCtxInner<GC>>(
+        context: &mut C,
+    ) -> (MleCommitmentIndex, ZkPartialSumcheckProof<GC, C>) {
+        let commitment_index = context
+            .read_next_pcs_commitment(NUM_ENCODING_VARIABLES as usize, LOG_NUM_POLYNOMIALS as usize)
+            .unwrap();
+        let claimed_sum_index = context.read_one().unwrap();
+        let sumcheck_data =
+            ZkPartialSumcheckParameters::basic_sumcheck(NUM_VARIABLES, claimed_sum_index)
+                .read_proof_from_transcript(context)
+                .unwrap();
+        (commitment_index, sumcheck_data)
+    }
+
+    fn build_all_constraints<GC: ZkIopCtx, C: ConstraintContextInnerExt<GC::EF>>(
+        (commitment_index, sumcheck_data): (MleCommitmentIndex, ZkPartialSumcheckProof<GC, C>),
+        ctx: &mut C,
+    ) {
+        ctx.assert_mle_eval(
+            commitment_index,
+            sumcheck_data.point.clone().into(),
+            sumcheck_data.claimed_eval.clone(),
+        );
+        sumcheck_data.build_constraints();
+    }
+
+    let (original_mle, mle_ef, claim) = generate_random_mle::<GC>(&mut rng, NUM_VARIABLES);
+
+    let (zk_basefold_prover, zk_stacked_verifier) =
+        initialize_zk_prover_and_verifier::<GC, MK>(1, NUM_ENCODING_VARIABLES);
+
+    let zkproof = {
+        let masks_length = compute_mask_length::<GC, _, _, _>(read_all, build_all_constraints);
+        let mut prover_context: StackedPcsZkProverContext<GC, MK> =
+            StackedPcsZkProverContext::initialize_only_lin_constraints(masks_length, &mut rng);
+
+        let commitment_index = prover_context
+            .commit_mle(&original_mle, LOG_NUM_POLYNOMIALS as usize, &zk_basefold_prover, &mut rng)
+            .expect("Failed to commit MLE");
+
+        let sum_claim = prover_context.add_value(claim);
+        let (_, sumcheck_constraint_data) =
+            zk_reduce_sumcheck_to_evaluation(mle_ef, &mut prover_context, sum_claim);
+
+        build_all_constraints((commitment_index, sumcheck_constraint_data), &mut prover_context);
+        prover_context.prove(&mut rng, Some(&zk_basefold_prover))
+    };
+
+    {
+        let mut context: StackedPcsZkVerificationContext<GC> = zkproof.open();
+        let (commitment_index, sumcheck_data) = read_all::<GC, _>(&mut context);
+        build_all_constraints((commitment_index, sumcheck_data), &mut context);
+        context.verify(Some(&zk_stacked_verifier)).expect("Large encoding verification failed");
+    }
+}
+
+/// Test Hadamard sumcheck with smaller dimensions (12, 6).
+#[test]
+fn test_zk_sumcheck_hadamard_small_dimensions() {
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    type GC = KoalaBearDegree4Duplex;
+
+    const NUM_ENCODING_VARIABLES: u32 = 12;
+    const LOG_NUM_POLYNOMIALS: u32 = 6;
+    const NUM_VARIABLES: u32 = LOG_NUM_POLYNOMIALS + NUM_ENCODING_VARIABLES;
+
+    fn read_all<GC: ZkIopCtx, C: ZkCnstrAndReadingCtxInner<GC>>(
+        context: &mut C,
+    ) -> (MleCommitmentIndex, MleCommitmentIndex, ZkPartialSumcheckProof<GC, C>) {
+        let commitment_index_base = context
+            .read_next_pcs_commitment(NUM_ENCODING_VARIABLES as usize, LOG_NUM_POLYNOMIALS as usize)
+            .unwrap();
+        let commitment_index_ext = context
+            .read_next_pcs_commitment(NUM_ENCODING_VARIABLES as usize, LOG_NUM_POLYNOMIALS as usize)
+            .unwrap();
+        let claimed_sum_index = context.read_one().unwrap();
+        let sumcheck_data =
+            ZkPartialSumcheckParameters::basic_hadamard_sumcheck(NUM_VARIABLES, claimed_sum_index)
+                .read_proof_from_transcript(context)
+                .unwrap();
+        (commitment_index_base, commitment_index_ext, sumcheck_data)
+    }
+
+    fn build_all_constraints<GC: ZkIopCtx, C: ConstraintContextInnerExt<GC::EF>>(
+        (commitment_index_base, commitment_index_ext, sumcheck_data): (
+            MleCommitmentIndex,
+            MleCommitmentIndex,
+            ZkPartialSumcheckProof<GC, C>,
+        ),
+        ctx: &mut C,
+    ) {
+        let base_eval = sumcheck_data.component_poly_evals[0][0].clone();
+        let ext_eval = sumcheck_data.component_poly_evals[0][1].clone();
+        ctx.assert_a_times_b_equals_c(
+            base_eval.clone(),
+            ext_eval.clone(),
+            sumcheck_data.claimed_eval.clone(),
+        );
+        ctx.assert_mle_eval(commitment_index_base, sumcheck_data.point.clone().into(), base_eval);
+        ctx.assert_mle_eval(commitment_index_ext, sumcheck_data.point.clone().into(), ext_eval);
+        sumcheck_data.build_constraints();
+    }
+
+    let (original_mle_1, original_mle_2, hadamard_product, claim) =
+        generate_random_hadamard_product::<GC>(&mut rng, NUM_VARIABLES);
+
+    let (zk_basefold_prover, zk_stacked_verifier) =
+        initialize_zk_prover_and_verifier::<GC, MK>(1, NUM_ENCODING_VARIABLES);
+
+    let zkproof = {
+        let masks_length = compute_mask_length::<GC, _, _, _>(read_all, build_all_constraints);
+        let mut prover_context: StackedPcsZkProverContext<GC, MK> =
+            StackedPcsZkProverContext::initialize(masks_length, &mut rng);
+
+        let commitment_index_base = prover_context
+            .commit_mle(
+                &original_mle_1,
+                LOG_NUM_POLYNOMIALS as usize,
+                &zk_basefold_prover,
+                &mut rng,
+            )
+            .expect("commit base MLE");
+        let commitment_index_ext = prover_context
+            .commit_mle(
+                &original_mle_2,
+                LOG_NUM_POLYNOMIALS as usize,
+                &zk_basefold_prover,
+                &mut rng,
+            )
+            .expect("commit ext MLE");
+
+        let sum_claim = prover_context.add_value(claim);
+        let (_, sumcheck_constraint_data) =
+            zk_reduce_sumcheck_to_evaluation(hadamard_product, &mut prover_context, sum_claim);
+
+        build_all_constraints(
+            (commitment_index_base, commitment_index_ext, sumcheck_constraint_data),
+            &mut prover_context,
+        );
+
+        prover_context.prove(&mut rng, Some(&zk_basefold_prover))
+    };
+
+    {
+        let mut context: StackedPcsZkVerificationContext<GC> = zkproof.open();
+        let (cib, cie, sd) = read_all::<GC, _>(&mut context);
+        build_all_constraints((cib, cie, sd), &mut context);
+        context
+            .verify(Some(&zk_stacked_verifier))
+            .expect("Hadamard small dimensions verification failed");
+    }
+}
+
+/// Test batched sumcheck with larger number of claims (5 MLEs).
+#[test]
+fn test_zk_sumcheck_batched_5_claims() {
+    let mut rng = ChaCha20Rng::from_entropy();
+
+    type GC = KoalaBearDegree4Duplex;
+    type EF = <GC as IopCtx>::EF;
+
+    const NUM_CLAIMS: usize = 5;
+    const NUM_ENCODING_VARIABLES: u32 = 14;
+    const LOG_NUM_POLYNOMIALS: u32 = 6;
+    const NUM_VARIABLES: u32 = LOG_NUM_POLYNOMIALS + NUM_ENCODING_VARIABLES;
+
+    fn read_all<GC: ZkIopCtx, C: ZkCnstrAndReadingCtxInner<GC>>(
+        context: &mut C,
+    ) -> (Vec<MleCommitmentIndex>, ZkPartialSumcheckProof<GC, C>) {
+        let commitment_indices: Vec<_> = (0..NUM_CLAIMS)
+            .map(|_| {
+                context
+                    .read_next_pcs_commitment(
+                        NUM_ENCODING_VARIABLES as usize,
+                        LOG_NUM_POLYNOMIALS as usize,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let claimed_sum_indices: Vec<_> =
+            (0..NUM_CLAIMS).map(|_| context.read_one().unwrap()).collect();
+        let lambda: GC::EF = context.challenger().sample_ext_element();
+        let sumcheck_data = ZkPartialSumcheckParameters {
+            num_variables: NUM_VARIABLES,
+            degree: 1,
+            poly_component_counts: vec![1; NUM_CLAIMS],
+            claim_exprs: claimed_sum_indices,
+            lambda,
+            t: 1,
+        }
+        .read_proof_from_transcript(context)
+        .unwrap();
+        (commitment_indices, sumcheck_data)
+    }
+
+    fn build_all_constraints<GC: ZkIopCtx, C: ConstraintContextInnerExt<GC::EF>>(
+        (commitment_indices, sumcheck_data): (
+            Vec<MleCommitmentIndex>,
+            ZkPartialSumcheckProof<GC, C>,
+        ),
+        ctx: &mut C,
+    ) {
+        let lambda = sumcheck_data.parameters.lambda;
+        for (i, commitment_index) in commitment_indices.iter().enumerate() {
+            ctx.assert_mle_eval(
+                *commitment_index,
+                sumcheck_data.point.clone().into(),
+                sumcheck_data.component_poly_evals[i][0].clone(),
+            );
+        }
+        let mut reversed_evals: Vec<C::Expr> =
+            sumcheck_data.component_poly_evals.iter().map(|e| e[0].clone()).collect();
+        reversed_evals.reverse();
+        let rlc_eval = C::poly_eval(&reversed_evals, lambda);
+        ctx.assert_zero(rlc_eval - sumcheck_data.claimed_eval.clone());
+        sumcheck_data.build_constraints();
+    }
+
+    let mut flat_mles = Vec::new();
+    let mut mles_ef = Vec::new();
+    let mut claims = Vec::new();
+    for _ in 0..NUM_CLAIMS {
+        let (original, ef, claim) = generate_random_mle::<GC>(&mut rng, NUM_VARIABLES);
+        flat_mles.push(original);
+        mles_ef.push(ef);
+        claims.push(claim);
+    }
+
+    let (zk_basefold_prover, zk_stacked_verifier) =
+        initialize_zk_prover_and_verifier::<GC, MK>(1, NUM_ENCODING_VARIABLES);
+
+    let zkproof = {
+        let masks_length = compute_mask_length::<GC, _, _, _>(read_all, build_all_constraints);
+        let mut prover_context: StackedPcsZkProverContext<GC, MK> =
+            StackedPcsZkProverContext::initialize_only_lin_constraints(masks_length, &mut rng);
+
+        let commitment_indices: Vec<_> = flat_mles
+            .iter()
+            .map(|flat_mle| {
+                prover_context
+                    .commit_mle(
+                        flat_mle,
+                        LOG_NUM_POLYNOMIALS as usize,
+                        &zk_basefold_prover,
+                        &mut rng,
+                    )
+                    .expect("Failed to commit MLE")
+            })
+            .collect();
+
+        let claim_values: Vec<_> =
+            claims.iter().map(|&claim| prover_context.add_value(claim)).collect();
+
+        let lambda: EF = prover_context.challenger().sample_ext_element();
+
+        let (_, sumcheck_constraint_data) = zk_reduce_sumcheck_to_evaluation_general(
+            mles_ef,
+            &mut prover_context,
+            claim_values,
+            1,
+            lambda,
+        );
+
+        build_all_constraints((commitment_indices, sumcheck_constraint_data), &mut prover_context);
+        prover_context.prove(&mut rng, Some(&zk_basefold_prover))
+    };
+
+    {
+        let mut context: StackedPcsZkVerificationContext<GC> = zkproof.open();
+        let (commitment_indices, sumcheck_data) = read_all::<GC, _>(&mut context);
+        build_all_constraints((commitment_indices, sumcheck_data), &mut context);
+        context.verify(Some(&zk_stacked_verifier)).expect("Batched 5-claims verification failed");
+    }
+}
+
+/// Test basic sumcheck without PCS at different variable counts.
+#[test]
+fn test_zk_sumcheck_no_pcs_various_sizes() {
+    type GC = KoalaBearDegree4Duplex;
+
+    for num_vars in [8u32, 12, 16, 20] {
+        let mut rng = ChaCha20Rng::from_entropy();
+
+        fn read_all_generic<GC: ZkIopCtx, C: ZkCnstrAndReadingCtxInner<GC>>(
+            context: &mut C,
+            num_variables: u32,
+        ) -> ZkPartialSumcheckProof<GC, C> {
+            let claimed_sum_index = context.read_one().unwrap();
+            ZkPartialSumcheckParameters::basic_hadamard_sumcheck(num_variables, claimed_sum_index)
+                .read_proof_from_transcript(context)
+                .unwrap()
+        }
+
+        let (_, _, product, claim_value) =
+            generate_random_hadamard_product::<GC>(&mut rng, num_vars);
+
+        let masks_length = compute_mask_length::<GC, _, _, _>(
+            |ctx: &mut _| read_all_generic::<GC, _>(ctx, num_vars),
+            |data: ZkPartialSumcheckProof<GC, _>, _ctx: &mut _| data.build_constraints(),
+        );
+
+        let zkproof = {
+            let mut prover_context: StackedPcsZkProverContext<GC, MK> =
+                StackedPcsZkProverContext::initialize(masks_length, &mut rng);
+            let claim = prover_context.add_value(claim_value);
+            let (_, sumcheck_constraint_data) =
+                zk_reduce_sumcheck_to_evaluation(product, &mut prover_context, claim);
+            sumcheck_constraint_data.build_constraints();
+            prover_context.prove(&mut rng, None::<&ZkBasefoldProver<GC, MK>>)
+        };
+
+        {
+            let mut context: StackedPcsZkVerificationContext<GC> = zkproof.open();
+            let sumcheck_data = read_all_generic::<GC, _>(&mut context, num_vars);
+            sumcheck_data.build_constraints();
+            context.verify::<ZkStackedPcsVerifier<GC>>(None).unwrap();
+        }
+    }
 }
