@@ -98,6 +98,34 @@ pub trait AirProver<GC: IopCtx, SC: ShardContext<GC>>: 'static + Send + Sync + S
     fn preprocessed_table_heights(
         pk: Arc<ProvingKey<GC, SC, Self>>,
     ) -> impl Future<Output = BTreeMap<String, usize>> + Send;
+
+    /// ZK version of `setup_and_prove_shard` that uses VEIL masking.
+    ///
+    /// Default implementation returns an error — only provers that support VEIL ZK should
+    /// override this.
+    fn setup_and_prove_shard_zk(
+        &self,
+        _program: Arc<Program<GC, SC>>,
+        _record: Record<GC, SC>,
+        _vk: Option<MachineVerifyingKey<GC>>,
+        _prover_permits: ProverSemaphore,
+    ) -> impl Future<
+        Output = Result<
+            (MachineVerifyingKey<GC>, ShardProof<GC, PcsProof<GC, SC>>, ProverPermit),
+            VeilProvingError,
+        >,
+    > + Send
+    where
+        GC: slop_challenger::IopCtx<
+            F = sp1_primitives::SP1Field,
+            EF = sp1_primitives::SP1ExtensionField,
+        >,
+        rand::distributions::Standard: rand::distributions::Distribution<GC::F>,
+    {
+        std::future::ready(Err(VeilProvingError::CommitmentFailed(
+            "VEIL ZK proving is not supported by this prover".into(),
+        )))
+    }
 }
 
 /// A proving key for an AIR prover.
@@ -371,6 +399,77 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>> A
                 .collect(),
         )
         .await
+    }
+
+    /// ZK version of `setup_and_prove_shard` that uses VEIL masking.
+    /// Generates traces, sets up proving/verifying keys, then calls `prove_shard_with_data_zk`.
+    async fn setup_and_prove_shard_zk(
+        &self,
+        program: Arc<Program<GC, SC>>,
+        record: Record<GC, SC>,
+        vk: Option<MachineVerifyingKey<GC>>,
+        prover_permits: ProverSemaphore,
+    ) -> Result<
+        (MachineVerifyingKey<GC>, ShardProof<GC, PcsProof<GC, SC>>, ProverPermit),
+        VeilProvingError,
+    >
+    where
+        GC: slop_challenger::IopCtx<
+            F = sp1_primitives::SP1Field,
+            EF = sp1_primitives::SP1ExtensionField,
+        >,
+        rand::distributions::Standard: rand::distributions::Distribution<GC::F>,
+    {
+        let pc_start = program.pc_start();
+        let enable_untrusted_programs = program.enable_untrusted_programs();
+        let initial_global_cumulative_sum = if let Some(vk) = vk {
+            vk.initial_global_cumulative_sum
+        } else {
+            let program = program.clone();
+            tokio::task::spawn_blocking(move || program.initial_global_cumulative_sum())
+                .instrument(tracing::debug_span!("initial_global_cumulative_sum"))
+                .await
+                .unwrap()
+        };
+
+        let trace_data = self
+            .inner
+            .trace_generator
+            .generate_traces(program, record, self.max_log_row_count(), prover_permits)
+            .instrument(tracing::debug_span!("generate full traces"))
+            .await;
+
+        let TraceData { preprocessed_traces, main_trace_data } = trace_data;
+
+        let (pk, vk) = {
+            let _span = tracing::debug_span!("setup_from_preprocessed_data_and_traces").entered();
+            self.setup_from_preprocessed_data_and_traces(
+                pc_start,
+                initial_global_cumulative_sum,
+                preprocessed_traces,
+                enable_untrusted_programs,
+            )
+        };
+
+        let pk = ProvingKey { vk: vk.clone(), preprocessed_data: pk };
+        let pk = Arc::new(pk);
+
+        let mut challenger = GC::default_challenger();
+        vk.observe_into(&mut challenger);
+
+        let shard_data = ShardData { pk, main_trace_data };
+
+        let prover = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _span = tracing::debug_span!("[ZK] prove shard with data (VEIL)").entered();
+            let mut rng = rand::thread_rng();
+            prover.prove_shard_with_data_zk(shard_data, challenger, &mut rng)
+        })
+        .await
+        .unwrap()?;
+
+        let (shard_proof, permit) = result;
+        Ok((vk, shard_proof, permit))
     }
 }
 
@@ -790,77 +889,6 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         };
 
         (proof, permit)
-    }
-
-    /// ZK version of `setup_and_prove_shard` that uses VEIL masking.
-    /// Generates traces, sets up proving/verifying keys, then calls `prove_shard_with_data_zk`.
-    pub async fn setup_and_prove_shard_zk(
-        &self,
-        program: Arc<Program<GC, SC>>,
-        record: Record<GC, SC>,
-        vk: Option<MachineVerifyingKey<GC>>,
-        prover_permits: ProverSemaphore,
-    ) -> Result<
-        (MachineVerifyingKey<GC>, ShardProof<GC, PcsProof<GC, SC>>, ProverPermit),
-        VeilProvingError,
-    >
-    where
-        GC: slop_challenger::IopCtx<
-            F = sp1_primitives::SP1Field,
-            EF = sp1_primitives::SP1ExtensionField,
-        >,
-        rand::distributions::Standard: rand::distributions::Distribution<GC::F>,
-    {
-        let pc_start = program.pc_start();
-        let enable_untrusted_programs = program.enable_untrusted_programs();
-        let initial_global_cumulative_sum = if let Some(vk) = vk {
-            vk.initial_global_cumulative_sum
-        } else {
-            let program = program.clone();
-            tokio::task::spawn_blocking(move || program.initial_global_cumulative_sum())
-                .instrument(tracing::debug_span!("initial_global_cumulative_sum"))
-                .await
-                .unwrap()
-        };
-
-        let trace_data = self
-            .inner
-            .trace_generator
-            .generate_traces(program, record, self.max_log_row_count(), prover_permits)
-            .instrument(tracing::debug_span!("generate full traces"))
-            .await;
-
-        let TraceData { preprocessed_traces, main_trace_data } = trace_data;
-
-        let (pk, vk) = {
-            let _span = tracing::debug_span!("setup_from_preprocessed_data_and_traces").entered();
-            self.setup_from_preprocessed_data_and_traces(
-                pc_start,
-                initial_global_cumulative_sum,
-                preprocessed_traces,
-                enable_untrusted_programs,
-            )
-        };
-
-        let pk = ProvingKey { vk: vk.clone(), preprocessed_data: pk };
-        let pk = Arc::new(pk);
-
-        let mut challenger = GC::default_challenger();
-        vk.observe_into(&mut challenger);
-
-        let shard_data = ShardData { pk, main_trace_data };
-
-        let prover = self.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let _span = tracing::debug_span!("[ZK] prove shard with data (VEIL)").entered();
-            let mut rng = rand::thread_rng();
-            prover.prove_shard_with_data_zk(shard_data, challenger, &mut rng)
-        })
-        .await
-        .unwrap()?;
-
-        let (shard_proof, permit) = result;
-        Ok((vk, shard_proof, permit))
     }
 
     /// ZK version of `prove_shard_with_data` that uses VEIL masking on trace commitments

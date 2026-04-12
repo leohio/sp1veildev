@@ -78,7 +78,12 @@ pub struct ShardProof<GC: IopCtx, Proof> {
     /// Optional VEIL ZK masking proof. `None` for standard non-ZK proofs.
     /// Hardcoded to `SP1GlobalContext` since VEIL only supports KoalaBear-based proofs.
     /// For non-SP1 contexts (e.g. outer wrap), this is always `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// NOTE: Do NOT use `skip_serializing_if` here. The worker pipeline serializes proofs
+    /// with bincode (a non-self-describing format) where every field must always be present.
+    /// Skipping the `None` variant breaks deserialization alignment, causing
+    /// "tag for enum is not valid" errors in reduction tasks.
+    #[serde(default)]
     pub veil_proof: Option<VeilMaskingProof<SP1GlobalContext>>,
 }
 

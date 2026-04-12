@@ -66,3 +66,8 @@ examples/fibonacci/fibonacci-plonk.bin
 # Claude Code
 .claude/
 CLAUDE.md
+
+# Audit report generation
+generate_audit_report.py
+soundnessGameClaude.py
+soundnessgame/
