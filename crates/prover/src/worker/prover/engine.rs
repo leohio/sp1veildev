@@ -129,6 +129,10 @@ impl<A: ArtifactClient, W: WorkerClient, C: SP1ProverComponents> SP1ProverEngine
         self.recursion_prover.run_shrink_wrap(request).await
     }
 
+    pub async fn run_shrink_wrap_zk(&self, request: RawTaskRequest) -> Result<(), TaskError> {
+        self.recursion_prover.run_shrink_wrap_zk(request).await
+    }
+
     pub async fn run_plonk(&self, request: RawTaskRequest) -> Result<(), TaskError> {
         self.recursion_prover.run_plonk(request).await
     }

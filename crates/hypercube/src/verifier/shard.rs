@@ -471,13 +471,9 @@ where {
         // Observe the public values.
         challenger.observe_constant_length_extension_slice(public_values);
 
-        // If the proof includes a VEIL ZK masking proof, observe the masked digest
-        // BEFORE the main commitment, matching the prover's challenger ordering.
-        if let Some(veil_proof) = veil_proof {
-            for elem in veil_proof.masked_commitment.iter() {
-                challenger.observe(GC::F::from_canonical_u32(elem.as_canonical_u32()));
-            }
-        }
+        // NOTE: The VEIL masked commitment is NOT added to the main STARK challenger.
+        // VEIL uses its own internal challenger. The main STARK challenger must remain
+        // identical to the non-VEIL version so the wrap circuit can verify correctly.
 
         // Observe the main commitment.
         challenger.observe(*main_commitment);
@@ -708,57 +704,47 @@ where {
 
             // Read the masked sub-protocol transcript elements from the VEIL
             // transcript, matching what the prover sent via send_values().
-            // These are the LogUp-GKR and zerocheck transcript values that
-            // would otherwise leak witness data.
+            // Each read_next(count) must match the corresponding send_values()
+            // block size on the prover side.
             {
-                // LogUp-GKR circuit output
+                // LogUp-GKR circuit output (one block per MLE)
                 let num_output = logup_gkr_proof.circuit_output.numerator.guts().as_buffer().len();
                 let den_output =
                     logup_gkr_proof.circuit_output.denominator.guts().as_buffer().len();
-                let _num_vals: Vec<_> =
-                    (0..num_output).map(|_| veil_verifier_ctx.read_one().unwrap()).collect();
-                let _den_vals: Vec<_> =
-                    (0..den_output).map(|_| veil_verifier_ctx.read_one().unwrap()).collect();
+                let _num_vals = veil_verifier_ctx.read_next(num_output).unwrap();
+                let _den_vals = veil_verifier_ctx.read_next(den_output).unwrap();
 
-                // LogUp-GKR round proofs
+                // LogUp-GKR round proofs (4 elements per round + sumcheck coeffs)
                 for round in &logup_gkr_proof.round_proofs {
-                    let _round_vals: Vec<_> =
-                        (0..4).map(|_| veil_verifier_ctx.read_one().unwrap()).collect();
+                    let _round_vals = veil_verifier_ctx.read_next(4).unwrap();
                     for uni_poly in &round.sumcheck_proof.univariate_polys {
-                        let _coeffs: Vec<_> = (0..uni_poly.coefficients.len())
-                            .map(|_| veil_verifier_ctx.read_one().unwrap())
-                            .collect();
+                        let _coeffs =
+                            veil_verifier_ctx.read_next(uni_poly.coefficients.len()).unwrap();
                     }
                 }
 
-                // LogUp-GKR chip evaluations
+                // LogUp-GKR chip evaluations (one block per trace)
                 for chip_eval in logup_gkr_proof.logup_evaluations.chip_openings.values() {
-                    let _main: Vec<_> = (0..chip_eval.main_trace_evaluations.len())
-                        .map(|_| veil_verifier_ctx.read_one().unwrap())
-                        .collect();
+                    let _main = veil_verifier_ctx
+                        .read_next(chip_eval.main_trace_evaluations.len())
+                        .unwrap();
                     if let Some(prep) = &chip_eval.preprocessed_trace_evaluations {
-                        let _prep: Vec<_> = (0..prep.len())
-                            .map(|_| veil_verifier_ctx.read_one().unwrap())
-                            .collect();
+                        let _prep = veil_verifier_ctx.read_next(prep.len()).unwrap();
                     }
                 }
 
                 // Zerocheck sumcheck univariate polynomial coefficients
                 for uni_poly in &zerocheck_proof.univariate_polys {
-                    let _coeffs: Vec<_> = (0..uni_poly.coefficients.len())
-                        .map(|_| veil_verifier_ctx.read_one().unwrap())
-                        .collect();
+                    let _coeffs = veil_verifier_ctx.read_next(uni_poly.coefficients.len()).unwrap();
                 }
 
-                // Zerocheck opened values
+                // Zerocheck opened values (one block per trace)
                 for chip_vals in opened_values.chips.values() {
-                    let _main: Vec<_> = (0..chip_vals.main.local.len())
-                        .map(|_| veil_verifier_ctx.read_one().unwrap())
-                        .collect();
+                    let _main = veil_verifier_ctx.read_next(chip_vals.main.local.len()).unwrap();
                     if !chip_vals.preprocessed.local.is_empty() {
-                        let _prep: Vec<_> = (0..chip_vals.preprocessed.local.len())
-                            .map(|_| veil_verifier_ctx.read_one().unwrap())
-                            .collect();
+                        let _prep = veil_verifier_ctx
+                            .read_next(chip_vals.preprocessed.local.len())
+                            .unwrap();
                     }
                 }
             }

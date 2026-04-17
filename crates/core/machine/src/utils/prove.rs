@@ -244,6 +244,64 @@ where
     Ok((proof, cycles))
 }
 
+/// Prove a program with VEIL ZK masking using SimpleProver.
+///
+/// Like `prove_core`, but uses `setup_and_prove_shard_zk` for each shard, generating
+/// VEIL-masked shard proofs that include a `VeilMaskingProof`. The verifier will
+/// automatically check the VEIL proof when verifying.
+///
+/// This is a test-only function intended for VEIL E2E testing.
+#[cfg(test)]
+pub async fn prove_core_zk<GC, SC, PC>(
+    prover: &SimpleProver<GC, SC, PC>,
+    program: Arc<Program>,
+    stdin: SP1Stdin,
+    opts: SP1CoreOpts,
+    context: SP1Context<'static>,
+) -> Result<
+    (MachineProof<GC, PcsProof<GC, SC>>, sp1_hypercube::MachineVerifyingKey<GC>, u64),
+    SP1CoreProverError,
+>
+where
+    GC: IopCtx<F = sp1_primitives::SP1Field, EF = sp1_primitives::SP1ExtensionField>,
+    SC: ShardContext<GC, Air = RiscvAir<GC::F>>,
+    PC: AirProver<GC, SC>,
+    GC::F: PrimeField32,
+    rand::distributions::Standard: rand::distributions::Distribution<GC::F>,
+{
+    let (all_records, cycles) =
+        generate_records::<GC::F>(program.clone(), stdin, opts, context.proof_nonce)?;
+
+    let mut shard_proofs = BTreeMap::new();
+    let mut last_vk: Option<sp1_hypercube::MachineVerifyingKey<GC>> = None;
+
+    for record in all_records {
+        let (vk, proof) = prover
+            .setup_and_prove_shard_zk(program.clone(), last_vk.clone(), record)
+            .await
+            .map_err(|e| SP1CoreProverError::IoError(io::Error::other(e.to_string())))?;
+
+        let public_values: &PublicValues<[GC::F; 4], [GC::F; 3], [GC::F; 4], GC::F> =
+            proof.public_values.as_slice().borrow();
+        shard_proofs.insert(
+            (
+                public_values.initial_timestamp,
+                public_values.last_timestamp,
+                public_values.previous_init_addr,
+                public_values.previous_finalize_addr,
+            ),
+            proof,
+        );
+        last_vk = Some(vk);
+    }
+
+    let vk = last_vk.expect("no shards produced");
+    let shard_proofs = shard_proofs.into_values().collect();
+    let proof = MachineProof { shard_proofs };
+
+    Ok((proof, vk, cycles))
+}
+
 /// Splice a trace chunk into shard-sized pieces sequentially.
 /// Returns a vector of (is_last, spliced_trace) pairs.
 fn splice_chunk_sequential<T: MinimalTrace>(

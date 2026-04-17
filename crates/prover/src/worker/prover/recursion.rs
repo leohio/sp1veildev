@@ -669,6 +669,20 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
     }
 
     pub async fn run_shrink_wrap(&self, request: RawTaskRequest) -> Result<(), TaskError> {
+        let use_veil = std::env::var("SP1_VEIL_ZK").map_or(false, |v| v == "1");
+        self.run_shrink_wrap_inner(request, use_veil).await
+    }
+
+    /// Like `run_shrink_wrap`, but uses VEIL ZK masking for the shrink proof.
+    pub async fn run_shrink_wrap_zk(&self, request: RawTaskRequest) -> Result<(), TaskError> {
+        self.run_shrink_wrap_inner(request, true).await
+    }
+
+    async fn run_shrink_wrap_inner(
+        &self,
+        request: RawTaskRequest,
+        use_veil_zk: bool,
+    ) -> Result<(), TaskError> {
         let RawTaskRequest { inputs, outputs, .. } = request;
         let [compress_proof_artifact] = inputs.try_into().unwrap();
         let [wrap_proof_artifact] = outputs.try_into().unwrap();
@@ -679,14 +693,28 @@ impl<A: ArtifactClient, C: SP1ProverComponents> SP1RecursionProver<A, C> {
             .instrument(tracing::debug_span!("download compress proof"))
             .await?;
 
-        let shrink_proof = self
-            .shrink_prover
-            .prove(compress_proof)
-            .instrument(tracing::info_span!("prove shrink"))
-            .await?;
+        let mut shrink_proof = if use_veil_zk {
+            self.shrink_prover
+                .prove_zk(compress_proof)
+                .instrument(tracing::info_span!("prove shrink (VEIL ZK)"))
+                .await?
+        } else {
+            self.shrink_prover
+                .prove(compress_proof)
+                .instrument(tracing::info_span!("prove shrink"))
+                .await?
+        };
 
         tracing::debug_span!("verify shrink proof")
             .in_scope(|| self.shrink_prover.verify(&shrink_proof))?;
+
+        // Strip the VEIL proof from the shrink proof before wrapping.
+        // The VEIL proof has been verified above; the wrap circuit doesn't understand it
+        // and would fail if it were included in the witness stream.
+        if shrink_proof.proof.veil_proof.is_some() {
+            tracing::info!("stripping verified VEIL proof from shrink proof before wrap");
+            shrink_proof.proof.veil_proof = None;
+        }
 
         let wrap_prover = self.wrap_prover().await?;
         let wrap_proof =
@@ -1054,25 +1082,30 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
         self.prover.setup(program, self.permits.clone()).await.1
     }
 
+    /// Execute the shrink program to get the execution record.
+    fn execute_shrink(
+        &self,
+        compressed_proof: SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>,
+    ) -> Result<ExecutionRecord<SP1Field>, TaskError> {
+        let mut runtime =
+            Executor::<SP1Field, SP1ExtensionField, _>::new(self.program.clone(), inner_perm());
+        runtime.witness_stream = self.prover_data.witness_stream(&{
+            let SP1RecursionProof { vk, proof, vk_merkle_proof } = compressed_proof;
+            let input =
+                SP1ShapedWitnessValues { vks_and_proofs: vec![(vk, proof)], is_complete: true };
+            SP1CircuitWitness::Shrink(
+                self.prover_data.append_merkle_proofs_to_witness(input, vec![vk_merkle_proof])?,
+            )
+        })?;
+        runtime.run().map_err(|e| TaskError::Fatal(e.into()))?;
+        Ok(runtime.record)
+    }
+
     async fn prove(
         &self,
         compressed_proof: SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>,
     ) -> Result<SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>, TaskError> {
-        let execution_record = {
-            let mut runtime =
-                Executor::<SP1Field, SP1ExtensionField, _>::new(self.program.clone(), inner_perm());
-            runtime.witness_stream = self.prover_data.witness_stream(&{
-                let SP1RecursionProof { vk, proof, vk_merkle_proof } = compressed_proof;
-                let input =
-                    SP1ShapedWitnessValues { vks_and_proofs: vec![(vk, proof)], is_complete: true };
-                SP1CircuitWitness::Shrink(
-                    self.prover_data
-                        .append_merkle_proofs_to_witness(input, vec![vk_merkle_proof])?,
-                )
-            })?;
-            runtime.run().map_err(|e| TaskError::Fatal(e.into()))?;
-            runtime.record
-        };
+        let execution_record = self.execute_shrink(compressed_proof)?;
 
         let (vk, proof, _permit) = self
             .prover
@@ -1097,22 +1130,7 @@ impl<C: SP1ProverComponents> ShrinkProver<C> {
         &self,
         compressed_proof: SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>,
     ) -> Result<SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>, TaskError> {
-        // Execute the shrink program to get the execution record (same as non-ZK).
-        let execution_record = {
-            let mut runtime =
-                Executor::<SP1Field, SP1ExtensionField, _>::new(self.program.clone(), inner_perm());
-            runtime.witness_stream = self.prover_data.witness_stream(&{
-                let SP1RecursionProof { vk, proof, vk_merkle_proof } = compressed_proof.clone();
-                let input =
-                    SP1ShapedWitnessValues { vks_and_proofs: vec![(vk, proof)], is_complete: true };
-                SP1CircuitWitness::Shrink(
-                    self.prover_data
-                        .append_merkle_proofs_to_witness(input, vec![vk_merkle_proof])?,
-                )
-            })?;
-            runtime.run().map_err(|e| TaskError::Fatal(e.into()))?;
-            runtime.record
-        };
+        let execution_record = self.execute_shrink(compressed_proof)?;
 
         // Generate the shrink STARK proof with VEIL ZK masking.
         let (vk, proof, _permit) = self

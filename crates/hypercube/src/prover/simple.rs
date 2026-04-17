@@ -187,6 +187,33 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: AirProver<GC, SC>> SimpleProver<GC, SC
         (vk, proof)
     }
 
+    /// Setup and prove a shard with VEIL ZK masking in one call.
+    ///
+    /// Returns the verifying key and the VEIL-masked shard proof.
+    #[inline]
+    #[allow(clippy::type_complexity)]
+    #[tracing::instrument(skip_all, name = "simple_setup_and_prove_shard_zk")]
+    pub async fn setup_and_prove_shard_zk(
+        &self,
+        program: Arc<Program<GC, SC>>,
+        vk: Option<MachineVerifyingKey<GC>>,
+        record: Record<GC, SC>,
+    ) -> Result<
+        (MachineVerifyingKey<GC>, ShardProof<GC, PcsProof<GC, SC>>),
+        super::shard::VeilProvingError,
+    >
+    where
+        GC: slop_challenger::IopCtx<
+            F = sp1_primitives::SP1Field,
+            EF = sp1_primitives::SP1ExtensionField,
+        >,
+        rand::distributions::Standard: rand::distributions::Distribution<GC::F>,
+    {
+        let (vk, proof, _) =
+            self.prover.setup_and_prove_shard_zk(program, record, vk, single_permit()).await?;
+        Ok((vk, proof))
+    }
+
     /// Get the preprocessed table heights from the proving key.
     pub async fn preprocessed_table_heights(
         &self,

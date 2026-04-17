@@ -33,6 +33,9 @@ pub mod syscall;
 pub mod utils;
 pub mod utype;
 
+#[cfg(test)]
+mod veil_e2e_tests;
+
 // Re-export the `SP1RecursionProof` struct from sp1_core_machine.
 //
 // This is done to avoid a circular dependency between sp1_core_machine and sp1_core_executor, and

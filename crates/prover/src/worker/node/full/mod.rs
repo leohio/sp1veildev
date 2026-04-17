@@ -445,6 +445,83 @@ mod tests {
         Ok(())
     }
 
+    /// Helper: get a compressed proof, then shrink+wrap it with VEIL ZK masking.
+    ///
+    /// The `shrink_wrap` call internally verifies both the shrink proof (including
+    /// VEIL ZK components) and the wrap proof. If this succeeds, the VEIL E2E
+    /// pipeline is working correctly for the given program.
+    async fn run_veil_shrink_wrap_test(elf: &[u8], stdin: SP1Stdin) -> anyhow::Result<()> {
+        let client = SP1LocalNodeBuilder::from_worker_client_builder(cpu_worker_builder())
+            .build()
+            .await
+            .unwrap();
+
+        let context = SP1Context::default();
+
+        // Step 1: Generate a compressed proof.
+        tracing::info!("generating compressed proof");
+        let compressed_proof = client
+            .prove_with_mode(elf, stdin, context, ProofMode::Compressed)
+            .await
+            .expect("compressed proof failed");
+
+        // Step 2: Shrink+wrap with VEIL ZK enabled.
+        // SAFETY: Tests are #[serial], so no concurrent env var mutation.
+        unsafe { std::env::set_var("SP1_VEIL_ZK", "1") };
+
+        tracing::info!("shrink+wrap with VEIL ZK");
+        let result = client.shrink_wrap(&compressed_proof.proof).await;
+
+        unsafe { std::env::remove_var("SP1_VEIL_ZK") };
+
+        result.expect("VEIL shrink+wrap failed");
+        Ok(())
+    }
+
+    // =========================================================================
+    // VEIL ZK E2E tests — different circuit types through shrink with VEIL
+    // =========================================================================
+
+    /// Fibonacci — basic arithmetic + branch + memory chips.
+    #[tokio::test]
+    #[serial]
+    async fn test_veil_e2e_fibonacci() -> anyhow::Result<()> {
+        setup_logger();
+        run_veil_shrink_wrap_test(&test_artifacts::FIBONACCI_ELF, SP1Stdin::default()).await
+    }
+
+    /// Keccak permutation — exercises the keccak precompile chip.
+    #[tokio::test]
+    #[serial]
+    async fn test_veil_e2e_keccak_permute() -> anyhow::Result<()> {
+        setup_logger();
+        run_veil_shrink_wrap_test(&test_artifacts::KECCAK_PERMUTE_ELF, SP1Stdin::default()).await
+    }
+
+    /// secp256r1 add — exercises the Weierstrass curve add chip.
+    #[tokio::test]
+    #[serial]
+    async fn test_veil_e2e_secp256r1_add() -> anyhow::Result<()> {
+        setup_logger();
+        run_veil_shrink_wrap_test(&test_artifacts::SECP256R1_ADD_ELF, SP1Stdin::default()).await
+    }
+
+    /// uint256 × uint2048 mul — exercises the bigint multiplication chip.
+    #[tokio::test]
+    #[serial]
+    async fn test_veil_e2e_u256xu2048_mul() -> anyhow::Result<()> {
+        setup_logger();
+        run_veil_shrink_wrap_test(&test_artifacts::U256XU2048_MUL_ELF, SP1Stdin::default()).await
+    }
+
+    /// SSZ withdrawals — exercises hash + memory-heavy Ethereum SSZ processing.
+    #[tokio::test]
+    #[serial]
+    async fn test_veil_e2e_ssz_withdrawals() -> anyhow::Result<()> {
+        setup_logger();
+        run_veil_shrink_wrap_test(&test_artifacts::SSZ_WITHDRAWALS_ELF, SP1Stdin::default()).await
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_node_deferred_compress() -> anyhow::Result<()> {

@@ -1975,6 +1975,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "slop-veil"
+version = "6.0.2"
+dependencies = [
+ "bincode",
+ "derive-where",
+ "futures",
+ "itertools 0.14.0",
+ "rand",
+ "rayon",
+ "serde",
+ "slop-algebra",
+ "slop-alloc",
+ "slop-basefold",
+ "slop-basefold-prover",
+ "slop-challenger",
+ "slop-commit",
+ "slop-dft",
+ "slop-futures",
+ "slop-koala-bear",
+ "slop-matrix",
+ "slop-merkle-tree",
+ "slop-multilinear",
+ "slop-stacked",
+ "slop-sumcheck",
+ "slop-symmetric",
+ "slop-tensor",
+ "slop-utils",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "slop-whir"
 version = "6.0.2"
 dependencies = [
@@ -2033,6 +2064,7 @@ dependencies = [
  "num-bigint 0.4.6",
  "num-traits",
  "num_cpus",
+ "rand",
  "rayon",
  "rayon-scan",
  "serde",
@@ -2056,6 +2088,7 @@ dependencies = [
  "slop-symmetric",
  "slop-tensor",
  "slop-uni-stark",
+ "slop-veil",
  "slop-whir",
  "sp1-derive",
  "sp1-primitives",

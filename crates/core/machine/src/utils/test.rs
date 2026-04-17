@@ -12,7 +12,7 @@ use tracing::Instrument;
 
 use crate::{io::SP1Stdin, riscv::RiscvAir};
 
-use super::prove_core;
+use super::{prove_core, prove_core_zk};
 
 // /// This type is the function signature used for malicious trace and public values generators for
 // /// failure test cases.
@@ -119,6 +119,52 @@ pub async fn run_test_core(
             .unwrap();
 
     prover.verify(&vk, &proof)?;
+    Ok(proof)
+}
+
+/// Run a full VEIL ZK prove-verify E2E test with the given program.
+///
+/// Proves each shard with VEIL masking and verifies the result, including
+/// the VEIL ZK proof component.
+pub async fn run_test_core_zk(
+    program: Arc<Program>,
+    inputs: SP1Stdin,
+    log_stacking_height: u32,
+    max_log_row_count: usize,
+) -> Result<
+    MachineProof<SP1GlobalContext, SP1PcsProofInner>,
+    MachineVerifierConfigError<SP1GlobalContext, SP1InnerPcs>,
+> {
+    let verifier = ShardVerifier::from_basefold_parameters(
+        FriConfig::default_fri_config(),
+        log_stacking_height,
+        max_log_row_count,
+        RiscvAir::machine(),
+    );
+    let shard_prover = CpuShardProver::<SP1GlobalContext, SP1InnerPcs, SP1InnerPcsProver, _>::new(
+        verifier.clone(),
+    );
+    let prover = SimpleProver::new(verifier, shard_prover);
+
+    let (proof, vk, _cycles) = prove_core_zk::<SP1GlobalContext, _, _>(
+        &prover,
+        program,
+        inputs,
+        SP1CoreOpts::default(),
+        SP1Context::default(),
+    )
+    .instrument(tracing::debug_span!("prove core zk"))
+    .await
+    .unwrap();
+
+    // Verify all shard proofs, including VEIL ZK components.
+    prover.verify(&vk, &proof)?;
+
+    // Assert VEIL proofs are present in all shards.
+    for shard_proof in &proof.shard_proofs {
+        assert!(shard_proof.veil_proof.is_some(), "VEIL proof should be present in each shard");
+    }
+
     Ok(proof)
 }
 

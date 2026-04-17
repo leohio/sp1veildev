@@ -952,12 +952,14 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         };
 
         // === Step 2: VEIL masked trace commitment ===
-        // Stack all chip traces into a single MLE preserving column structure.
+        // Stack all chip traces into a flat (1-column) MLE.
+        // Row dimension matches the actual padded trace height (power of 2).
         let (stacked_mle, log_num_polys) = {
             let _span = tracing::debug_span!("[ZK] stack traces for VEIL").entered();
             stack_traces_for_veil(&traces)
         };
 
+        // For a flat (1-column) MLE: num_variables() = log2(padded_rows) + log_num_polys.
         let num_encoding_vars = stacked_mle.num_variables().saturating_sub(log_num_polys as u32);
         let num_variables = stacked_mle.num_variables();
 
@@ -974,12 +976,12 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
         // (which are generated after VEIL context initialization).
         // The mask length governs the size of VEIL's random mask vector;
         // overestimating is safe (costs a few extra field multiplications).
-        let max_log_row_count = self.max_log_row_count();
         let num_chips = shard_chips.len();
-        let estimated_transcript_reads = 2 * (1usize << max_log_row_count)      // GKR output (num + den MLEs)
-            + max_log_row_count * 10                // GKR round proofs + sumcheck coeffs
+        let actual_log_rows = num_encoding_vars as usize;
+        let estimated_transcript_reads = 2 * (1usize << actual_log_rows)        // GKR output (num + den MLEs)
+            + actual_log_rows * 10                  // GKR round proofs + sumcheck coeffs
             + num_chips * 200                       // chip evaluations (generous width estimate)
-            + max_log_row_count * 5                 // zerocheck sumcheck coefficients
+            + actual_log_rows * 5                   // zerocheck sumcheck coefficients
             + num_chips * 200; // zerocheck opened values
 
         let mask_length = compute_mask_length::<VeilGC, _>(
@@ -1024,12 +1026,12 @@ impl<GC: IopCtx, SC: ShardContext<GC>, C: DefaultJaggedProver<GC, SC::Config>>
 
         tracing::info!("[ZK] VEIL masked commitment generated successfully");
 
-        // === Step 3: Absorb both commitments into the Fiat-Shamir challenger ===
-        // VEIL masked commitment first (binds ZK proof to transcript).
-        for &elem in masked_digest.iter() {
-            challenger.observe(elem);
-        }
-        // Standard commitment (for LogUp-GKR / zerocheck compatibility).
+        // === Step 3: Absorb the standard commitment into the Fiat-Shamir challenger ===
+        // IMPORTANT: We do NOT add the VEIL masked commitment to the main STARK
+        // challenger. The VEIL proof uses its own internal challenger.
+        // Adding it here would change the challenger state and break compatibility
+        // with the wrap circuit, which verifies the shrink proof using the standard
+        // challenger that only knows about the standard commitment.
         challenger.observe(main_commit);
 
         // Observe the number of chips and chip metadata.
@@ -1246,16 +1248,17 @@ pub enum VeilProvingError {
     ConstraintProofFailed(String),
 }
 
-/// Stack all chip traces into a single MLE suitable for VEIL commitment.
+/// Stack all chip traces into a single **flat** (1-column) MLE suitable for VEIL commitment.
 ///
-/// Unlike the original broken flatten (which discarded column structure into a 1-column MLE),
-/// this function preserves the multi-column structure of each chip's trace:
+/// The returned MLE has `padded_rows * padded_cols` elements in a single column.
+/// The VEIL PCS commit path (`commit_mle → stack_mle`) will reshape this flat MLE into
+/// the stacked (multi-column) form internally. Returning a flat MLE avoids double-stacking
+/// and ensures that `num_variables()` returns the total variable count
+/// (`log2(padded_rows) + log_num_polys`), which is needed for correct `eval_at` evaluation
+/// over both row and column variables.
 ///
-/// - Each chip contributes its columns (from its `PaddedMle`'s inner tensor).
-/// - All columns across all chips are collected.
-/// - Column count is padded to the next power of 2 (`2^log_num_polys`).
-/// - Row count is the maximum across all columns, padded to a power of 2.
-/// - The result is a row-major `Mle` with shape `[padded_rows, padded_cols]`.
+/// Row count is the maximum across all trace columns, padded to a power of 2.
+/// This matches the zerocheck evaluation point dimension.
 fn stack_traces_for_veil<F: Field>(
     traces: &Traces<F, CpuBackend>,
 ) -> (slop_multilinear::Mle<F, CpuBackend>, usize) {
@@ -1293,7 +1296,9 @@ fn stack_traces_for_veil<F: Field>(
     let max_rows = all_columns.iter().map(|(n, _)| *n).max().unwrap_or(0);
     let padded_rows = if max_rows == 0 { 1 } else { max_rows.next_power_of_two() };
 
-    // Build row-major matrix: data[row * padded_num_cols + col].
+    // Build the data in row-major order: data[row * padded_num_cols + col].
+    // Then flatten into a single-column MLE so that commit_mle's internal
+    // stack_mle() correctly reshapes it.
     let mut data = vec![F::zero(); padded_rows * padded_num_cols];
     for (col_idx, (_num_rows, col_data)) in all_columns.iter().enumerate() {
         for (row_idx, &val) in col_data.iter().enumerate() {
@@ -1301,7 +1306,8 @@ fn stack_traces_for_veil<F: Field>(
         }
     }
 
-    let mle = Mle::new(RowMajorMatrix::new(data, padded_num_cols).into());
+    // Return a FLAT (1-column) MLE. The VEIL commit path will stack it internally.
+    let mle = Mle::new(RowMajorMatrix::new(data, 1).into());
     (mle, log_num_polys)
 }
 
