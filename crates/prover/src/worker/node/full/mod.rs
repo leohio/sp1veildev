@@ -479,12 +479,16 @@ mod tests {
     }
 
     // =========================================================================
-    // VEIL ZK E2E tests — different circuit types through shrink with VEIL
+    // VEIL ZK E2E tests — different circuit types through shrink with VEIL.
+    //
+    // These are long-running (~15 min each) and gated behind `#[ignore]`.
+    // Run with: cargo test --release -p sp1-prover -- --ignored test_veil_e2e
     // =========================================================================
 
     /// Fibonacci — basic arithmetic + branch + memory chips.
     #[tokio::test]
     #[serial]
+    #[ignore = "long-running VEIL E2E test, run with --ignored"]
     async fn test_veil_e2e_fibonacci() -> anyhow::Result<()> {
         setup_logger();
         run_veil_shrink_wrap_test(&test_artifacts::FIBONACCI_ELF, SP1Stdin::default()).await
@@ -493,6 +497,7 @@ mod tests {
     /// Keccak permutation — exercises the keccak precompile chip.
     #[tokio::test]
     #[serial]
+    #[ignore = "long-running VEIL E2E test, run with --ignored"]
     async fn test_veil_e2e_keccak_permute() -> anyhow::Result<()> {
         setup_logger();
         run_veil_shrink_wrap_test(&test_artifacts::KECCAK_PERMUTE_ELF, SP1Stdin::default()).await
@@ -501,6 +506,7 @@ mod tests {
     /// secp256r1 add — exercises the Weierstrass curve add chip.
     #[tokio::test]
     #[serial]
+    #[ignore = "long-running VEIL E2E test, run with --ignored"]
     async fn test_veil_e2e_secp256r1_add() -> anyhow::Result<()> {
         setup_logger();
         run_veil_shrink_wrap_test(&test_artifacts::SECP256R1_ADD_ELF, SP1Stdin::default()).await
@@ -509,6 +515,7 @@ mod tests {
     /// uint256 × uint2048 mul — exercises the bigint multiplication chip.
     #[tokio::test]
     #[serial]
+    #[ignore = "long-running VEIL E2E test, run with --ignored"]
     async fn test_veil_e2e_u256xu2048_mul() -> anyhow::Result<()> {
         setup_logger();
         run_veil_shrink_wrap_test(&test_artifacts::U256XU2048_MUL_ELF, SP1Stdin::default()).await
@@ -517,6 +524,7 @@ mod tests {
     /// SSZ withdrawals — exercises hash + memory-heavy Ethereum SSZ processing.
     #[tokio::test]
     #[serial]
+    #[ignore = "long-running VEIL E2E test, run with --ignored"]
     async fn test_veil_e2e_ssz_withdrawals() -> anyhow::Result<()> {
         setup_logger();
         run_veil_shrink_wrap_test(&test_artifacts::SSZ_WITHDRAWALS_ELF, SP1Stdin::default()).await
